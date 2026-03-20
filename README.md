@@ -1,2 +1,2 @@
 # Arborration
-Creating bayesian classifiers using tree-based anomaly detection methods. 
+Bayesian classifiers using tree-based anomaly detection methods. 
