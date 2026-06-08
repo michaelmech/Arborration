@@ -1,0 +1,582 @@
+"""IsoTree JSON-usage feature selectors for Arborration benchmarks."""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+from isotree import IsolationForest
+
+
+def select_features_for_task(X, y, *, task, **kwargs):
+    """Dispatch to the task-appropriate feature selector."""
+    if task == "classification":
+        kwargs = dict(kwargs)
+        kwargs.pop("regression_target_bins", None)
+        return select_features_by_class_contrast_isotree_json_usage(X, y, **kwargs)
+    if task == "regression":
+        kwargs = dict(kwargs)
+        kwargs.pop("max_samples_per_side", None)
+        kwargs.pop("min_class_samples", None)
+        kwargs.pop("combine_classes", None)
+        return select_features_by_target_weighted_isotree_json_usage(
+            X,
+            y,
+            task="regression",
+            **kwargs,
+        )
+    raise ValueError("task must be 'classification' or 'regression'.")
+
+
+def select_features_by_target_weighted_isotree_json_usage(
+    X,
+    y,
+    *,
+    task,
+    ntrees=100,
+    sample_size=256,
+    ndim=2,
+    max_iter=20,
+    min_usage_count=1,
+    n_refits=1,
+    require_used_in_any_refit=True,
+    target_draw_probability=0.25,
+    regression_target_bins=10,
+    random_state=42,
+    nthreads=-1,
+    min_features_to_keep=1,
+    max_refit_usage_fraction_for_removal=0.0,
+    max_remove_fraction_per_iter=0.10,
+    validation_scorer=None,
+    score_tolerance=0.0,
+    standardize_X=True,
+    isotree_kwargs=None,
+    verbose=True,
+):
+    """Select features that appear in IsoTree splits anchored to target columns."""
+    if task not in {"classification", "regression"}:
+        raise ValueError("task must be 'classification' or 'regression'.")
+    if not (0.0 < target_draw_probability < 1.0):
+        raise ValueError("target_draw_probability must be between 0 and 1.")
+    if ndim < 2:
+        raise ValueError("This target-anchored method is intended for ndim >= 2.")
+    if score_tolerance < 0:
+        raise ValueError("score_tolerance must be nonnegative.")
+
+    isotree_kwargs = isotree_kwargs or {}
+    _validate_conservative_removal_params(
+        n_refits=n_refits,
+        min_features_to_keep=min_features_to_keep,
+        max_refit_usage_fraction_for_removal=max_refit_usage_fraction_for_removal,
+        max_remove_fraction_per_iter=max_remove_fraction_per_iter,
+    )
+
+    X_raw = _to_frame(X)
+    y = pd.Series(y).reset_index(drop=True)
+    if len(X_raw) != len(y):
+        raise ValueError("X and y must have the same number of rows.")
+
+    X_work = _standardize_frame(X_raw) if standardize_X else X_raw.copy()
+    original_features = list(X_work.columns)
+    current_features = list(X_work.columns)
+    Y_target = _make_target_frame(
+        y,
+        task=task,
+        n_bins=regression_target_bins,
+        existing_columns=original_features,
+    )
+    target_features = list(Y_target.columns)
+
+    history = []
+    removed_features_all = []
+
+    for iteration in range(max_iter):
+        X_current = X_work[current_features].reset_index(drop=True)
+        Y_current = Y_target.reset_index(drop=True)
+        usage_by_refit = []
+
+        for refit_ix in range(n_refits):
+            seed = random_state + 10_000 * iteration + refit_ix
+            X_aug = pd.concat([X_current, Y_current], axis=1)
+            column_weights = _make_augmented_column_weights(
+                x_feature_names=current_features,
+                target_feature_names=target_features,
+                target_draw_probability=target_draw_probability,
+            )
+            model = IsolationForest(
+                ntrees=ntrees,
+                sample_size=min(sample_size, len(X_aug)),
+                ndim=ndim,
+                missing_action="fail",
+                penalize_range=False,
+                random_seed=seed,
+                nthreads=nthreads,
+                **isotree_kwargs,
+            )
+            model.fit(X_aug, column_weights=column_weights)
+            usage_by_refit.append(
+                _anchored_usage_from_isotree_json(
+                    model,
+                    x_feature_names=current_features,
+                    target_feature_names=target_features,
+                )
+            )
+
+        usage_matrix = np.vstack(usage_by_refit)
+        selection_usage = usage_matrix.max(axis=0) if require_used_in_any_refit else usage_matrix.sum(axis=0)
+        usage = (
+            pd.DataFrame(
+                {
+                    "feature": current_features,
+                    "target_anchored_usage_for_selection": selection_usage,
+                    "target_anchored_usage_mean": usage_matrix.mean(axis=0),
+                    "target_anchored_usage_min": usage_matrix.min(axis=0),
+                    "target_anchored_usage_max": usage_matrix.max(axis=0),
+                    "n_refits_used_with_target": (usage_matrix > 0).sum(axis=0),
+                }
+            )
+            .sort_values(
+                ["target_anchored_usage_for_selection", "target_anchored_usage_mean"],
+                ascending=False,
+            )
+            .reset_index(drop=True)
+        )
+
+        proposed_to_remove = _conservative_removal_candidates(
+            usage,
+            usage_column="target_anchored_usage_for_selection",
+            tie_breaker_columns=["target_anchored_usage_mean"],
+            current_features=current_features,
+            min_usage_count=min_usage_count,
+            n_refits=n_refits,
+            min_features_to_keep=min_features_to_keep,
+            max_refit_usage_fraction_for_removal=max_refit_usage_fraction_for_removal,
+            max_remove_fraction_per_iter=max_remove_fraction_per_iter,
+        )
+        to_remove, validation_result = _apply_validation_veto(
+            X_raw=X_raw,
+            y=y,
+            current_features=current_features,
+            proposed_to_remove=proposed_to_remove,
+            validation_scorer=validation_scorer,
+            score_tolerance=score_tolerance,
+        )
+
+        history.append(
+            {
+                "iteration": iteration,
+                "n_features_before": len(current_features),
+                "n_proposed_removed": len(proposed_to_remove),
+                "n_removed": len(to_remove),
+                "proposed_removed_features": proposed_to_remove,
+                "removed_features": to_remove,
+                "validation": validation_result,
+                "usage": usage,
+                "target_draw_probability": target_draw_probability,
+                "target_features": target_features,
+            }
+        )
+
+        if verbose:
+            print(
+                f"iter={iteration} | features={len(current_features)} | "
+                f"refits={n_refits} | propose={len(proposed_to_remove)} | "
+                f"remove={len(to_remove)} | target_p={target_draw_probability:g}"
+            )
+        if not to_remove:
+            break
+
+        removed_features_all.extend(to_remove)
+        remove_set = set(to_remove)
+        current_features = [f for f in current_features if f not in remove_set]
+        if len(current_features) <= min_features_to_keep:
+            break
+
+    result = {
+        "selected_features": current_features,
+        "removed_features": removed_features_all,
+        "history": history,
+        "final_usage": history[-1]["usage"] if history else None,
+        "original_features": original_features,
+        "target_features": target_features,
+        "task": task,
+        "method": "target_weighted_json_usage_ndim2",
+        "target_draw_probability": target_draw_probability,
+    }
+    return X_raw[current_features], result
+
+
+def select_features_by_class_contrast_isotree_json_usage(
+    X,
+    y,
+    *,
+    ntrees=100,
+    sample_size=256,
+    ndim=2,
+    max_iter=20,
+    min_usage_count=1,
+    n_refits=1,
+    require_used_in_any_refit=True,
+    target_draw_probability=0.25,
+    max_samples_per_side=3000,
+    min_class_samples=10,
+    combine_classes="max",
+    random_state=42,
+    nthreads=-1,
+    min_features_to_keep=1,
+    max_refit_usage_fraction_for_removal=0.0,
+    max_remove_fraction_per_iter=0.10,
+    validation_scorer=None,
+    score_tolerance=0.0,
+    standardize_X=True,
+    isotree_kwargs=None,
+    verbose=True,
+):
+    """Classification selector using balanced one-vs-rest target-anchored splits."""
+    if ndim < 2:
+        raise ValueError("This method is intended for ndim >= 2.")
+    if not (0.0 < target_draw_probability < 1.0):
+        raise ValueError("target_draw_probability must be between 0 and 1.")
+    if combine_classes not in {"max", "mean"}:
+        raise ValueError("combine_classes must be 'max' or 'mean'.")
+    if score_tolerance < 0:
+        raise ValueError("score_tolerance must be nonnegative.")
+
+    isotree_kwargs = isotree_kwargs or {}
+    _validate_conservative_removal_params(
+        n_refits=n_refits,
+        min_features_to_keep=min_features_to_keep,
+        max_refit_usage_fraction_for_removal=max_refit_usage_fraction_for_removal,
+        max_remove_fraction_per_iter=max_remove_fraction_per_iter,
+    )
+
+    X_raw = _to_frame(X)
+    y = pd.Series(y).reset_index(drop=True)
+    if len(X_raw) != len(y):
+        raise ValueError("X and y must have the same number of rows.")
+
+    classes = np.array(sorted(y.unique()))
+    if len(classes) < 2:
+        raise ValueError("Need at least two classes.")
+
+    X_work = _standardize_frame(X_raw) if standardize_X else X_raw.astype(float).copy()
+    original_features = list(X_work.columns)
+    current_features = list(X_work.columns)
+    history = []
+    removed_features_all = []
+
+    for iteration in range(max_iter):
+        X_current = X_work[current_features].reset_index(drop=True)
+        y_current = y.reset_index(drop=True)
+        rng = np.random.default_rng(random_state + 100_000 * iteration)
+        usage_by_refit = []
+        score_by_refit = []
+
+        for class_ix, cls in enumerate(classes):
+            pos_idx = np.flatnonzero(y_current.to_numpy() == cls)
+            rest_idx = np.flatnonzero(y_current.to_numpy() != cls)
+            if len(pos_idx) < min_class_samples or len(rest_idx) < min_class_samples:
+                continue
+
+            m = min(len(pos_idx), len(rest_idx), max_samples_per_side)
+            for refit_ix in range(n_refits):
+                seed = random_state + 100_000 * iteration + 10_000 * class_ix + refit_ix
+                pos_sample = rng.choice(pos_idx, size=m, replace=False)
+                rest_sample = rng.choice(rest_idx, size=m, replace=False)
+                sample_idx = np.concatenate([pos_sample, rest_sample])
+                rng.shuffle(sample_idx)
+
+                X_sub = X_current.iloc[sample_idx].reset_index(drop=True)
+                target_name = f"__target_ovr__{class_ix}"
+                y_sub = (y_current.iloc[sample_idx].to_numpy() == cls).astype(float)
+                Y_sub = _standardize_frame(pd.DataFrame({target_name: y_sub}))
+                X_aug = pd.concat([X_sub, Y_sub], axis=1)
+                column_weights = _make_augmented_column_weights(
+                    x_feature_names=current_features,
+                    target_feature_names=[target_name],
+                    target_draw_probability=target_draw_probability,
+                )
+                model = IsolationForest(
+                    ntrees=ntrees,
+                    sample_size=min(sample_size, len(X_aug)),
+                    ndim=ndim,
+                    missing_action="fail",
+                    penalize_range=False,
+                    random_seed=seed,
+                    nthreads=nthreads,
+                    **isotree_kwargs,
+                )
+                model.fit(X_aug, column_weights=column_weights)
+
+                counts = _anchored_usage_from_isotree_json(
+                    model,
+                    x_feature_names=current_features,
+                    target_feature_names=[target_name],
+                ).astype(float)
+                usage_by_refit.append(counts)
+                denom = counts.sum()
+                score_by_refit.append(counts / denom if denom > 0 else np.zeros_like(counts))
+
+        if not usage_by_refit:
+            break
+
+        usage_matrix = np.vstack(usage_by_refit)
+        score_matrix = np.vstack(score_by_refit)
+        selection_usage = usage_matrix.max(axis=0) if require_used_in_any_refit else usage_matrix.sum(axis=0)
+        target_contrast_score = score_matrix.max(axis=0) if combine_classes == "max" else score_matrix.mean(axis=0)
+        usage = (
+            pd.DataFrame(
+                {
+                    "feature": current_features,
+                    "target_contrast_usage_for_selection": selection_usage,
+                    "target_contrast_score": target_contrast_score,
+                    "target_contrast_usage_mean": usage_matrix.mean(axis=0),
+                    "target_contrast_usage_max": usage_matrix.max(axis=0),
+                    "n_refits_used_with_target": (usage_matrix > 0).sum(axis=0),
+                }
+            )
+            .sort_values(
+                ["target_contrast_usage_for_selection", "target_contrast_score"],
+                ascending=False,
+            )
+            .reset_index(drop=True)
+        )
+
+        proposed_to_remove = _conservative_removal_candidates(
+            usage,
+            usage_column="target_contrast_usage_for_selection",
+            tie_breaker_columns=["target_contrast_score"],
+            current_features=current_features,
+            min_usage_count=min_usage_count,
+            n_refits=len(usage_by_refit),
+            min_features_to_keep=min_features_to_keep,
+            max_refit_usage_fraction_for_removal=max_refit_usage_fraction_for_removal,
+            max_remove_fraction_per_iter=max_remove_fraction_per_iter,
+        )
+        to_remove, validation_result = _apply_validation_veto(
+            X_raw=X_raw,
+            y=y,
+            current_features=current_features,
+            proposed_to_remove=proposed_to_remove,
+            validation_scorer=validation_scorer,
+            score_tolerance=score_tolerance,
+        )
+
+        history.append(
+            {
+                "iteration": iteration,
+                "n_features_before": len(current_features),
+                "n_proposed_removed": len(proposed_to_remove),
+                "n_removed": len(to_remove),
+                "proposed_removed_features": proposed_to_remove,
+                "removed_features": to_remove,
+                "validation": validation_result,
+                "usage": usage,
+                "classes": classes.tolist(),
+                "target_draw_probability": target_draw_probability,
+                "combine_classes": combine_classes,
+            }
+        )
+
+        if verbose:
+            print(
+                f"iter={iteration} | features={len(current_features)} | "
+                f"classes={len(classes)} | refits={n_refits} | "
+                f"propose={len(proposed_to_remove)} | remove={len(to_remove)} | "
+                f"target_p={target_draw_probability:g}"
+            )
+        if not to_remove:
+            break
+
+        removed_features_all.extend(to_remove)
+        remove_set = set(to_remove)
+        current_features = [f for f in current_features if f not in remove_set]
+        if len(current_features) <= min_features_to_keep:
+            break
+
+    result = {
+        "selected_features": current_features,
+        "removed_features": removed_features_all,
+        "history": history,
+        "final_usage": history[-1]["usage"] if history else None,
+        "original_features": original_features,
+        "classes": classes.tolist(),
+        "method": "class_contrast_json_usage_ndim2",
+        "target_draw_probability": target_draw_probability,
+    }
+    return X_raw[current_features], result
+
+
+def _to_frame(X):
+    if isinstance(X, pd.DataFrame):
+        out = X.copy()
+    else:
+        X = np.asarray(X)
+        out = pd.DataFrame(X, columns=[f"feature_{i}" for i in range(X.shape[1])])
+    out.columns = [str(c) for c in out.columns]
+    if len(set(out.columns)) != len(out.columns):
+        raise ValueError("X must have unique column names.")
+    return out
+
+
+def _standardize_frame(X):
+    X = X.astype(float)
+    return (X - X.mean(axis=0)) / (X.std(axis=0, ddof=0) + 1e-12)
+
+
+def _make_target_frame(y, *, task, n_bins=10, existing_columns=None):
+    y = pd.Series(y).reset_index(drop=True)
+    existing_columns = set(existing_columns or [])
+    prefix = "__target__"
+    while any(str(c).startswith(prefix) for c in existing_columns):
+        prefix = "_" + prefix
+
+    if task == "classification":
+        return _standardize_frame(pd.get_dummies(y.astype("category"), prefix=prefix, dtype=float))
+
+    if task == "regression":
+        y_float = y.astype(float)
+        Y = pd.DataFrame({f"{prefix}z": y_float, f"{prefix}rank": y_float.rank(pct=True)})
+        q = min(int(n_bins), y_float.nunique())
+        if q >= 2:
+            bins = pd.qcut(y_float, q=q, labels=False, duplicates="drop")
+            Y = pd.concat([Y, pd.get_dummies(bins, prefix=f"{prefix}bin", dtype=float)], axis=1)
+        return _standardize_frame(Y)
+
+    raise ValueError("task must be 'classification' or 'regression'.")
+
+
+def _make_augmented_column_weights(x_feature_names, target_feature_names, *, target_draw_probability=0.25):
+    n_x = len(x_feature_names)
+    n_t = len(target_feature_names)
+    if n_x < 1:
+        raise ValueError("Need at least one X feature.")
+    if n_t < 1:
+        raise ValueError("Need at least one target feature.")
+    target_total_weight = target_draw_probability / (1.0 - target_draw_probability) * float(n_x)
+    return np.concatenate([np.ones(n_x, dtype=float), np.full(n_t, target_total_weight / n_t)])
+
+
+def _anchored_usage_from_isotree_json(model, *, x_feature_names, target_feature_names):
+    trees = model.to_json(as_str=False)
+    if isinstance(trees, dict):
+        trees = [trees]
+
+    x_features = set(map(str, x_feature_names))
+    target_features = set(map(str, target_feature_names))
+    counts = pd.Series(0, index=list(x_feature_names), dtype="int64")
+
+    for tree in trees:
+        for node in _iter_isotree_node_dicts(tree):
+            node_strings = set(_collect_strings(node))
+            used_x = node_strings & x_features
+            if used_x and (node_strings & target_features):
+                for feature in used_x:
+                    counts.loc[feature] += 1
+
+    return counts.loc[list(x_feature_names)].to_numpy(dtype=np.int64)
+
+
+def _iter_isotree_node_dicts(tree):
+    if isinstance(tree, dict):
+        values = list(tree.values())
+        if values and all(isinstance(value, dict) for value in values):
+            for node in values:
+                yield node
+        else:
+            yield tree
+
+
+def _collect_strings(obj):
+    if isinstance(obj, str):
+        return [obj]
+    if isinstance(obj, dict):
+        found = []
+        for value in obj.values():
+            found.extend(_collect_strings(value))
+        return found
+    if isinstance(obj, list):
+        found = []
+        for item in obj:
+            found.extend(_collect_strings(item))
+        return found
+    return []
+
+
+def _validate_conservative_removal_params(
+    *,
+    n_refits,
+    min_features_to_keep,
+    max_refit_usage_fraction_for_removal,
+    max_remove_fraction_per_iter,
+):
+    if n_refits < 1:
+        raise ValueError("n_refits must be at least 1.")
+    if min_features_to_keep < 1:
+        raise ValueError("min_features_to_keep must be at least 1.")
+    if not (0.0 <= max_refit_usage_fraction_for_removal <= 1.0):
+        raise ValueError("max_refit_usage_fraction_for_removal must be between 0 and 1.")
+    if not (0.0 < max_remove_fraction_per_iter <= 1.0):
+        raise ValueError("max_remove_fraction_per_iter must be in (0, 1].")
+
+
+def _conservative_removal_candidates(
+    usage,
+    *,
+    usage_column,
+    tie_breaker_columns,
+    current_features,
+    min_usage_count,
+    n_refits,
+    min_features_to_keep,
+    max_refit_usage_fraction_for_removal,
+    max_remove_fraction_per_iter,
+):
+    usage = usage.copy()
+    usage["refit_usage_fraction"] = usage["n_refits_used_with_target"] / float(n_refits)
+    candidate_mask = (
+        (usage[usage_column] < min_usage_count)
+        & (usage["refit_usage_fraction"] <= max_refit_usage_fraction_for_removal)
+    )
+    candidate_features = usage.loc[candidate_mask, "feature"].tolist()
+    if not candidate_features:
+        return []
+
+    max_removable_for_floor = max(0, len(current_features) - min_features_to_keep)
+    max_removable_for_budget = max(1, int(np.floor(max_remove_fraction_per_iter * len(current_features))))
+    max_removable = min(max_removable_for_floor, max_removable_for_budget)
+    if max_removable <= 0:
+        return []
+
+    sort_columns = [usage_column, "refit_usage_fraction"] + list(tie_breaker_columns)
+    low_usage = usage.sort_values(sort_columns, ascending=True)
+    return (
+        low_usage.loc[low_usage["feature"].isin(candidate_features), "feature"]
+        .head(max_removable)
+        .tolist()
+    )
+
+
+def _apply_validation_veto(
+    *,
+    X_raw,
+    y,
+    current_features,
+    proposed_to_remove,
+    validation_scorer,
+    score_tolerance,
+):
+    if not proposed_to_remove or validation_scorer is None:
+        return list(proposed_to_remove), None
+
+    remove_set = set(proposed_to_remove)
+    candidate_features = [feature for feature in current_features if feature not in remove_set]
+    current_score = validation_scorer(X_raw[current_features], y)
+    candidate_score = validation_scorer(X_raw[candidate_features], y)
+    accepted = candidate_score >= current_score - score_tolerance
+    validation_result = {
+        "current_score": current_score,
+        "candidate_score": candidate_score,
+        "score_tolerance": score_tolerance,
+        "vetoed": not accepted,
+    }
+    return (list(proposed_to_remove), validation_result) if accepted else ([], validation_result)
