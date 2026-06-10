@@ -12,6 +12,13 @@ def select_features_for_task(X, y, *, task, **kwargs):
     if task == "classification":
         kwargs = dict(kwargs)
         kwargs.pop("regression_target_bins", None)
+        kwargs.pop("n_target_permutations", None)
+        kwargs.pop("n_permutation_refits", None)
+        kwargs.pop("permutation_mode", None)
+        kwargs.pop("permutation_scope", None)
+        kwargs.pop("permutation_usage_margin", None)
+        kwargs.pop("min_permutation_adjusted_usage", None)
+        kwargs.pop("competitive_real_target_weight", None)
         return select_features_by_class_contrast_isotree_json_usage(X, y, **kwargs)
     if task == "regression":
         kwargs = dict(kwargs)
@@ -50,9 +57,11 @@ def select_features_by_target_weighted_isotree_json_usage(
     score_tolerance=0.0,
     n_target_permutations=0,
     n_permutation_refits=1,
+    permutation_mode="separate",
     permutation_scope="borderline",
     permutation_usage_margin=1,
     min_permutation_adjusted_usage=0.0,
+    competitive_real_target_weight=0.60,
     standardize_X=True,
     isotree_kwargs=None,
     verbose=True,
@@ -69,8 +78,10 @@ def select_features_by_target_weighted_isotree_json_usage(
     _validate_permutation_params(
         n_target_permutations=n_target_permutations,
         n_permutation_refits=n_permutation_refits,
+        permutation_mode=permutation_mode,
         permutation_scope=permutation_scope,
         permutation_usage_margin=permutation_usage_margin,
+        competitive_real_target_weight=competitive_real_target_weight,
     )
 
     isotree_kwargs = isotree_kwargs or {}
@@ -104,15 +115,33 @@ def select_features_by_target_weighted_isotree_json_usage(
         X_current = X_work[current_features].reset_index(drop=True)
         Y_current = Y_target.reset_index(drop=True)
         usage_by_refit = []
+        decoy_usage_by_refit = []
 
         for refit_ix in range(n_refits):
             seed = random_state + 10_000 * iteration + refit_ix
-            X_aug = pd.concat([X_current, Y_current], axis=1)
-            column_weights = _make_augmented_column_weights(
-                x_feature_names=current_features,
-                target_feature_names=target_features,
-                target_draw_probability=target_draw_probability,
-            )
+            if permutation_mode == "competitive":
+                decoy_target = _make_permuted_decoy_target_frame(
+                    Y_target=Y_current,
+                    target_features=target_features,
+                    seed=random_state + 1_000_000 + 10_000 * iteration + refit_ix,
+                )
+                decoy_features = list(decoy_target.columns)
+                X_aug = pd.concat([X_current, Y_current, decoy_target], axis=1)
+                column_weights = _make_competitive_augmented_column_weights(
+                    x_feature_names=current_features,
+                    real_target_feature_names=target_features,
+                    decoy_target_feature_names=decoy_features,
+                    target_draw_probability=target_draw_probability,
+                    real_target_weight=competitive_real_target_weight,
+                )
+            else:
+                decoy_features = None
+                X_aug = pd.concat([X_current, Y_current], axis=1)
+                column_weights = _make_augmented_column_weights(
+                    x_feature_names=current_features,
+                    target_feature_names=target_features,
+                    target_draw_probability=target_draw_probability,
+                )
             model = IsolationForest(
                 ntrees=ntrees,
                 sample_size=min(sample_size, len(X_aug)),
@@ -131,6 +160,14 @@ def select_features_by_target_weighted_isotree_json_usage(
                     target_feature_names=target_features,
                 )
             )
+            if decoy_features is not None:
+                decoy_usage_by_refit.append(
+                    _anchored_usage_from_isotree_json(
+                        model,
+                        x_feature_names=current_features,
+                        target_feature_names=decoy_features,
+                    )
+                )
 
         usage_matrix = np.vstack(usage_by_refit)
         selection_usage = usage_matrix.max(axis=0) if require_used_in_any_refit else usage_matrix.sum(axis=0)
@@ -165,7 +202,35 @@ def select_features_by_target_weighted_isotree_json_usage(
         )
         permutation_result = None
         proposed_to_remove = raw_proposed_to_remove
-        if n_target_permutations:
+        if permutation_mode == "competitive":
+            decoy_usage_matrix = np.vstack(decoy_usage_by_refit)
+            decoy_selection_usage = (
+                decoy_usage_matrix.max(axis=0)
+                if require_used_in_any_refit
+                else decoy_usage_matrix.sum(axis=0)
+            )
+            usage, permutation_result = _add_competitive_permutation_calibration(
+                usage,
+                observed_column="target_anchored_usage_for_selection",
+                decoy_selection_usage=decoy_selection_usage,
+                decoy_usage_matrix=decoy_usage_matrix,
+                feature_names=current_features,
+            )
+            proposed_to_remove = _permutation_calibrated_removal_candidates(
+                usage,
+                raw_proposed_to_remove=raw_proposed_to_remove,
+                observed_column="target_anchored_usage_for_selection",
+                adjusted_column="permutation_adjusted_usage_for_selection",
+                tie_breaker_columns=["target_anchored_usage_mean"],
+                current_features=current_features,
+                min_usage_count=min_usage_count,
+                min_permutation_adjusted_usage=min_permutation_adjusted_usage,
+                permutation_scope=permutation_scope,
+                permutation_usage_margin=permutation_usage_margin,
+                min_features_to_keep=min_features_to_keep,
+                max_remove_fraction_per_iter=max_remove_fraction_per_iter,
+            )
+        elif n_target_permutations:
             null_usage_matrix = _target_permutation_usage_matrix(
                 X_current=X_current,
                 y=y,
@@ -225,6 +290,7 @@ def select_features_by_target_weighted_isotree_json_usage(
                 "usage": usage,
                 "target_draw_probability": target_draw_probability,
                 "target_features": target_features,
+                "permutation_mode": permutation_mode,
             }
         )
 
@@ -233,7 +299,7 @@ def select_features_by_target_weighted_isotree_json_usage(
                 f"iter={iteration} | features={len(current_features)} | "
                 f"refits={n_refits} | propose={len(proposed_to_remove)} | "
                 f"remove={len(to_remove)} | target_p={target_draw_probability:g} | "
-                f"perms={n_target_permutations}"
+                f"permutation_mode={permutation_mode}"
             )
         if not to_remove:
             break
@@ -254,6 +320,7 @@ def select_features_by_target_weighted_isotree_json_usage(
         "task": task,
         "method": "target_weighted_json_usage_ndim2",
         "target_draw_probability": target_draw_probability,
+        "permutation_mode": permutation_mode,
     }
     return X_raw[current_features], result
 
@@ -509,6 +576,51 @@ def _make_augmented_column_weights(x_feature_names, target_feature_names, *, tar
     return np.concatenate([np.ones(n_x, dtype=float), np.full(n_t, target_total_weight / n_t)])
 
 
+def _make_competitive_augmented_column_weights(
+    x_feature_names,
+    real_target_feature_names,
+    decoy_target_feature_names,
+    *,
+    target_draw_probability=0.25,
+    real_target_weight=0.60,
+):
+    n_x = len(x_feature_names)
+    n_real = len(real_target_feature_names)
+    n_decoy = len(decoy_target_feature_names)
+    if n_x < 1:
+        raise ValueError("Need at least one X feature.")
+    if n_real < 1 or n_decoy < 1:
+        raise ValueError("Need at least one real target and one decoy target feature.")
+
+    target_total_weight = target_draw_probability / (1.0 - target_draw_probability) * float(n_x)
+    real_total_weight = real_target_weight * target_total_weight
+    decoy_total_weight = (1.0 - real_target_weight) * target_total_weight
+    return np.concatenate(
+        [
+            np.ones(n_x, dtype=float),
+            np.full(n_real, real_total_weight / n_real),
+            np.full(n_decoy, decoy_total_weight / n_decoy),
+        ]
+    )
+
+
+def _make_permuted_decoy_target_frame(
+    *,
+    Y_target,
+    target_features,
+    seed,
+):
+    rng = np.random.default_rng(seed)
+    row_order = rng.permutation(len(Y_target))
+    decoy = Y_target.iloc[row_order].reset_index(drop=True).reindex(columns=target_features)
+    decoy.columns = [_decoy_target_feature_name(feature) for feature in target_features]
+    return decoy
+
+
+def _decoy_target_feature_name(feature):
+    return f"__permuted_{feature}"
+
+
 def _anchored_usage_from_isotree_json(model, *, x_feature_names, target_feature_names):
     trees = model.to_json(as_str=False)
     if isinstance(trees, dict):
@@ -576,17 +688,23 @@ def _validate_permutation_params(
     *,
     n_target_permutations,
     n_permutation_refits,
+    permutation_mode,
     permutation_scope,
     permutation_usage_margin,
+    competitive_real_target_weight,
 ):
     if n_target_permutations < 0:
         raise ValueError("n_target_permutations must be nonnegative.")
     if n_permutation_refits < 1:
         raise ValueError("n_permutation_refits must be at least 1.")
+    if permutation_mode not in {"separate", "competitive"}:
+        raise ValueError("permutation_mode must be 'separate' or 'competitive'.")
     if permutation_scope not in {"all", "candidates", "borderline"}:
         raise ValueError("permutation_scope must be 'all', 'candidates', or 'borderline'.")
     if permutation_usage_margin < 0:
         raise ValueError("permutation_usage_margin must be nonnegative.")
+    if not (0.5 <= competitive_real_target_weight < 1.0):
+        raise ValueError("competitive_real_target_weight must be in [0.5, 1.0).")
 
 
 def _target_permutation_usage_matrix(
@@ -683,9 +801,45 @@ def _add_permutation_calibration(usage, *, observed_column, null_usage_matrix, f
         ascending=False,
     ).reset_index(drop=True)
     return usage, {
+        "mode": "separate",
         "n_null_fits": int(null_usage_matrix.shape[0]),
         "null_usage_mean_mean": float(null_mean.mean()),
         "null_usage_mean_max": float(null_mean.max()),
+    }
+
+
+def _add_competitive_permutation_calibration(
+    usage,
+    *,
+    observed_column,
+    decoy_selection_usage,
+    decoy_usage_matrix,
+    feature_names,
+):
+    usage = usage.copy()
+    decoy_frame = pd.DataFrame(
+        {
+            "feature": list(feature_names),
+            "permutation_decoy_usage_for_selection": decoy_selection_usage,
+            "permutation_decoy_usage_mean": decoy_usage_matrix.mean(axis=0),
+            "permutation_decoy_usage_min": decoy_usage_matrix.min(axis=0),
+            "permutation_decoy_usage_max": decoy_usage_matrix.max(axis=0),
+        }
+    )
+    usage = usage.merge(decoy_frame, on="feature", how="left")
+    observed = usage[observed_column].to_numpy(dtype=float)
+    decoy = usage["permutation_decoy_usage_for_selection"].to_numpy(dtype=float)
+    usage["permutation_adjusted_usage_for_selection"] = observed - decoy
+    usage["permutation_competitive_ratio"] = (observed - decoy) / (observed + decoy + 1e-12)
+    usage = usage.sort_values(
+        ["permutation_adjusted_usage_for_selection", observed_column],
+        ascending=False,
+    ).reset_index(drop=True)
+    return usage, {
+        "mode": "competitive",
+        "n_competitive_refits": int(decoy_usage_matrix.shape[0]),
+        "decoy_usage_mean_mean": float(decoy_usage_matrix.mean(axis=0).mean()),
+        "decoy_usage_mean_max": float(decoy_usage_matrix.mean(axis=0).max()),
     }
 
 
