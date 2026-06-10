@@ -48,6 +48,11 @@ def select_features_by_target_weighted_isotree_json_usage(
     max_remove_fraction_per_iter=0.10,
     validation_scorer=None,
     score_tolerance=0.0,
+    n_target_permutations=0,
+    n_permutation_refits=1,
+    permutation_scope="borderline",
+    permutation_usage_margin=1,
+    min_permutation_adjusted_usage=0.0,
     standardize_X=True,
     isotree_kwargs=None,
     verbose=True,
@@ -61,6 +66,12 @@ def select_features_by_target_weighted_isotree_json_usage(
         raise ValueError("This target-anchored method is intended for ndim >= 2.")
     if score_tolerance < 0:
         raise ValueError("score_tolerance must be nonnegative.")
+    _validate_permutation_params(
+        n_target_permutations=n_target_permutations,
+        n_permutation_refits=n_permutation_refits,
+        permutation_scope=permutation_scope,
+        permutation_usage_margin=permutation_usage_margin,
+    )
 
     isotree_kwargs = isotree_kwargs or {}
     _validate_conservative_removal_params(
@@ -141,7 +152,7 @@ def select_features_by_target_weighted_isotree_json_usage(
             .reset_index(drop=True)
         )
 
-        proposed_to_remove = _conservative_removal_candidates(
+        raw_proposed_to_remove = _conservative_removal_candidates(
             usage,
             usage_column="target_anchored_usage_for_selection",
             tie_breaker_columns=["target_anchored_usage_mean"],
@@ -152,6 +163,46 @@ def select_features_by_target_weighted_isotree_json_usage(
             max_refit_usage_fraction_for_removal=max_refit_usage_fraction_for_removal,
             max_remove_fraction_per_iter=max_remove_fraction_per_iter,
         )
+        permutation_result = None
+        proposed_to_remove = raw_proposed_to_remove
+        if n_target_permutations:
+            null_usage_matrix = _target_permutation_usage_matrix(
+                X_current=X_current,
+                y=y,
+                task=task,
+                current_features=current_features,
+                target_features=target_features,
+                target_draw_probability=target_draw_probability,
+                regression_target_bins=regression_target_bins,
+                n_target_permutations=n_target_permutations,
+                n_permutation_refits=n_permutation_refits,
+                base_seed=random_state + 1_000_000 + 10_000 * iteration,
+                ntrees=ntrees,
+                sample_size=sample_size,
+                ndim=ndim,
+                nthreads=nthreads,
+                isotree_kwargs=isotree_kwargs,
+            )
+            usage, permutation_result = _add_permutation_calibration(
+                usage,
+                observed_column="target_anchored_usage_for_selection",
+                null_usage_matrix=null_usage_matrix,
+                feature_names=current_features,
+            )
+            proposed_to_remove = _permutation_calibrated_removal_candidates(
+                usage,
+                raw_proposed_to_remove=raw_proposed_to_remove,
+                observed_column="target_anchored_usage_for_selection",
+                adjusted_column="permutation_adjusted_usage_for_selection",
+                tie_breaker_columns=["target_anchored_usage_mean"],
+                current_features=current_features,
+                min_usage_count=min_usage_count,
+                min_permutation_adjusted_usage=min_permutation_adjusted_usage,
+                permutation_scope=permutation_scope,
+                permutation_usage_margin=permutation_usage_margin,
+                min_features_to_keep=min_features_to_keep,
+                max_remove_fraction_per_iter=max_remove_fraction_per_iter,
+            )
         to_remove, validation_result = _apply_validation_veto(
             X_raw=X_raw,
             y=y,
@@ -170,6 +221,7 @@ def select_features_by_target_weighted_isotree_json_usage(
                 "proposed_removed_features": proposed_to_remove,
                 "removed_features": to_remove,
                 "validation": validation_result,
+                "permutation": permutation_result,
                 "usage": usage,
                 "target_draw_probability": target_draw_probability,
                 "target_features": target_features,
@@ -180,7 +232,8 @@ def select_features_by_target_weighted_isotree_json_usage(
             print(
                 f"iter={iteration} | features={len(current_features)} | "
                 f"refits={n_refits} | propose={len(proposed_to_remove)} | "
-                f"remove={len(to_remove)} | target_p={target_draw_probability:g}"
+                f"remove={len(to_remove)} | target_p={target_draw_probability:g} | "
+                f"perms={n_target_permutations}"
             )
         if not to_remove:
             break
@@ -519,6 +572,184 @@ def _validate_conservative_removal_params(
         raise ValueError("max_remove_fraction_per_iter must be in (0, 1].")
 
 
+def _validate_permutation_params(
+    *,
+    n_target_permutations,
+    n_permutation_refits,
+    permutation_scope,
+    permutation_usage_margin,
+):
+    if n_target_permutations < 0:
+        raise ValueError("n_target_permutations must be nonnegative.")
+    if n_permutation_refits < 1:
+        raise ValueError("n_permutation_refits must be at least 1.")
+    if permutation_scope not in {"all", "candidates", "borderline"}:
+        raise ValueError("permutation_scope must be 'all', 'candidates', or 'borderline'.")
+    if permutation_usage_margin < 0:
+        raise ValueError("permutation_usage_margin must be nonnegative.")
+
+
+def _target_permutation_usage_matrix(
+    *,
+    X_current,
+    y,
+    task,
+    current_features,
+    target_features,
+    target_draw_probability,
+    regression_target_bins,
+    n_target_permutations,
+    n_permutation_refits,
+    base_seed,
+    ntrees,
+    sample_size,
+    ndim,
+    nthreads,
+    isotree_kwargs,
+):
+    rows = []
+    y_values = pd.Series(y).reset_index(drop=True).to_numpy()
+    column_weights = _make_augmented_column_weights(
+        x_feature_names=current_features,
+        target_feature_names=target_features,
+        target_draw_probability=target_draw_probability,
+    )
+
+    for permutation_ix in range(n_target_permutations):
+        permutation_seed = base_seed + 10_000 * permutation_ix
+        rng = np.random.default_rng(permutation_seed)
+        y_permuted = pd.Series(rng.permutation(y_values))
+        Y_permuted = _make_target_frame(
+            y_permuted,
+            task=task,
+            n_bins=regression_target_bins,
+            existing_columns=current_features,
+        )
+        Y_permuted = Y_permuted.reindex(columns=target_features, fill_value=0.0).reset_index(drop=True)
+        X_aug = pd.concat([X_current.reset_index(drop=True), Y_permuted], axis=1)
+
+        for refit_ix in range(n_permutation_refits):
+            seed = permutation_seed + refit_ix
+            model = IsolationForest(
+                ntrees=ntrees,
+                sample_size=min(sample_size, len(X_aug)),
+                ndim=ndim,
+                missing_action="fail",
+                penalize_range=False,
+                random_seed=seed,
+                nthreads=nthreads,
+                **isotree_kwargs,
+            )
+            model.fit(X_aug, column_weights=column_weights)
+            rows.append(
+                _anchored_usage_from_isotree_json(
+                    model,
+                    x_feature_names=current_features,
+                    target_feature_names=target_features,
+                )
+            )
+
+    return np.vstack(rows)
+
+
+def _add_permutation_calibration(usage, *, observed_column, null_usage_matrix, feature_names):
+    usage = usage.copy()
+    null_mean = null_usage_matrix.mean(axis=0)
+    null_std = null_usage_matrix.std(axis=0, ddof=0)
+    null_frame = pd.DataFrame(
+        {
+            "feature": list(feature_names),
+            "permutation_null_usage_mean": null_mean,
+            "permutation_null_usage_std": null_std,
+            "permutation_null_usage_max": null_usage_matrix.max(axis=0),
+        }
+    )
+    empirical_p_values = {}
+    for feature_ix, feature in enumerate(feature_names):
+        observed = float(usage.loc[usage["feature"] == feature, observed_column].iloc[0])
+        empirical_p_values[feature] = (1.0 + float((null_usage_matrix[:, feature_ix] >= observed).sum())) / (
+            1.0 + null_usage_matrix.shape[0]
+        )
+
+    usage = usage.merge(null_frame, on="feature", how="left")
+    observed = usage[observed_column].to_numpy(dtype=float)
+    usage["permutation_adjusted_usage_for_selection"] = observed - usage["permutation_null_usage_mean"]
+    usage["permutation_usage_z_score"] = (
+        observed - usage["permutation_null_usage_mean"]
+    ) / (usage["permutation_null_usage_std"] + 1e-12)
+    usage["permutation_empirical_p_value"] = usage["feature"].map(empirical_p_values)
+    usage = usage.sort_values(
+        ["permutation_adjusted_usage_for_selection", observed_column],
+        ascending=False,
+    ).reset_index(drop=True)
+    return usage, {
+        "n_null_fits": int(null_usage_matrix.shape[0]),
+        "null_usage_mean_mean": float(null_mean.mean()),
+        "null_usage_mean_max": float(null_mean.max()),
+    }
+
+
+def _permutation_calibrated_removal_candidates(
+    usage,
+    *,
+    raw_proposed_to_remove,
+    observed_column,
+    adjusted_column,
+    tie_breaker_columns,
+    current_features,
+    min_usage_count,
+    min_permutation_adjusted_usage,
+    permutation_scope,
+    permutation_usage_margin,
+    min_features_to_keep,
+    max_remove_fraction_per_iter,
+):
+    raw_set = set(raw_proposed_to_remove)
+    if permutation_scope == "all":
+        scoped = set(usage["feature"])
+    elif permutation_scope == "candidates":
+        scoped = raw_set
+    else:
+        borderline_limit = min_usage_count + permutation_usage_margin
+        scoped = set(usage.loc[usage[observed_column] <= borderline_limit, "feature"]) | raw_set
+
+    calibrated = set(
+        usage.loc[
+            usage["feature"].isin(scoped)
+            & (usage[adjusted_column] <= min_permutation_adjusted_usage),
+            "feature",
+        ]
+    )
+    candidate_features = raw_set | calibrated
+    if not candidate_features:
+        return []
+
+    sort_columns = [adjusted_column, observed_column] + list(tie_breaker_columns)
+    low_usage = usage.sort_values(sort_columns, ascending=True)
+    ordered = low_usage.loc[low_usage["feature"].isin(candidate_features), "feature"].tolist()
+    return _limit_removal_candidates(
+        ordered,
+        current_features=current_features,
+        min_features_to_keep=min_features_to_keep,
+        max_remove_fraction_per_iter=max_remove_fraction_per_iter,
+    )
+
+
+def _limit_removal_candidates(
+    candidate_features,
+    *,
+    current_features,
+    min_features_to_keep,
+    max_remove_fraction_per_iter,
+):
+    max_removable_for_floor = max(0, len(current_features) - min_features_to_keep)
+    max_removable_for_budget = max(1, int(np.floor(max_remove_fraction_per_iter * len(current_features))))
+    max_removable = min(max_removable_for_floor, max_removable_for_budget)
+    if max_removable <= 0:
+        return []
+    return list(candidate_features)[:max_removable]
+
+
 def _conservative_removal_candidates(
     usage,
     *,
@@ -541,18 +772,14 @@ def _conservative_removal_candidates(
     if not candidate_features:
         return []
 
-    max_removable_for_floor = max(0, len(current_features) - min_features_to_keep)
-    max_removable_for_budget = max(1, int(np.floor(max_remove_fraction_per_iter * len(current_features))))
-    max_removable = min(max_removable_for_floor, max_removable_for_budget)
-    if max_removable <= 0:
-        return []
-
     sort_columns = [usage_column, "refit_usage_fraction"] + list(tie_breaker_columns)
     low_usage = usage.sort_values(sort_columns, ascending=True)
-    return (
-        low_usage.loc[low_usage["feature"].isin(candidate_features), "feature"]
-        .head(max_removable)
-        .tolist()
+    ordered = low_usage.loc[low_usage["feature"].isin(candidate_features), "feature"].tolist()
+    return _limit_removal_candidates(
+        ordered,
+        current_features=current_features,
+        min_features_to_keep=min_features_to_keep,
+        max_remove_fraction_per_iter=max_remove_fraction_per_iter,
     )
 
 
