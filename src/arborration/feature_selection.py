@@ -1,4 +1,4 @@
-"""IsoTree JSON-usage feature selectors for Arborration benchmarks."""
+"""IsoTree JSON-routed feature selectors for Arborration benchmarks."""
 
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ def select_features_by_target_weighted_isotree_json_usage(
     isotree_kwargs=None,
     verbose=True,
 ):
-    """Select features that appear in IsoTree splits anchored to target columns."""
+    """Select features that change routing at IsoTree splits anchored to targets."""
     if task not in {"classification", "regression"}:
         raise ValueError("task must be 'classification' or 'regression'.")
     if not (0.0 < target_draw_probability < 1.0):
@@ -154,16 +154,18 @@ def select_features_by_target_weighted_isotree_json_usage(
             )
             model.fit(X_aug, column_weights=column_weights)
             usage_by_refit.append(
-                _anchored_usage_from_isotree_json(
+                _anchored_flip_usage_from_isotree_json(
                     model,
+                    X_aug=X_aug,
                     x_feature_names=current_features,
                     target_feature_names=target_features,
                 )
             )
             if decoy_features is not None:
                 decoy_usage_by_refit.append(
-                    _anchored_usage_from_isotree_json(
+                    _anchored_flip_usage_from_isotree_json(
                         model,
+                        X_aug=X_aug,
                         x_feature_names=current_features,
                         target_feature_names=decoy_features,
                     )
@@ -175,15 +177,15 @@ def select_features_by_target_weighted_isotree_json_usage(
             pd.DataFrame(
                 {
                     "feature": current_features,
-                    "target_anchored_usage_for_selection": selection_usage,
-                    "target_anchored_usage_mean": usage_matrix.mean(axis=0),
-                    "target_anchored_usage_min": usage_matrix.min(axis=0),
-                    "target_anchored_usage_max": usage_matrix.max(axis=0),
+                    "target_anchored_flip_count_for_selection": selection_usage,
+                    "target_anchored_flip_count_mean": usage_matrix.mean(axis=0),
+                    "target_anchored_flip_count_min": usage_matrix.min(axis=0),
+                    "target_anchored_flip_count_max": usage_matrix.max(axis=0),
                     "n_refits_used_with_target": (usage_matrix > 0).sum(axis=0),
                 }
             )
             .sort_values(
-                ["target_anchored_usage_for_selection", "target_anchored_usage_mean"],
+                ["target_anchored_flip_count_for_selection", "target_anchored_flip_count_mean"],
                 ascending=False,
             )
             .reset_index(drop=True)
@@ -191,8 +193,8 @@ def select_features_by_target_weighted_isotree_json_usage(
 
         raw_proposed_to_remove = _conservative_removal_candidates(
             usage,
-            usage_column="target_anchored_usage_for_selection",
-            tie_breaker_columns=["target_anchored_usage_mean"],
+            usage_column="target_anchored_flip_count_for_selection",
+            tie_breaker_columns=["target_anchored_flip_count_mean"],
             current_features=current_features,
             min_usage_count=min_usage_count,
             n_refits=n_refits,
@@ -211,17 +213,19 @@ def select_features_by_target_weighted_isotree_json_usage(
             )
             usage, permutation_result = _add_competitive_permutation_calibration(
                 usage,
-                observed_column="target_anchored_usage_for_selection",
+                observed_column="target_anchored_flip_count_for_selection",
                 decoy_selection_usage=decoy_selection_usage,
                 decoy_usage_matrix=decoy_usage_matrix,
                 feature_names=current_features,
+                observed_label="target_anchored_flip_count",
+                decoy_label="permutation_decoy_flip_count",
             )
             proposed_to_remove = _permutation_calibrated_removal_candidates(
                 usage,
                 raw_proposed_to_remove=raw_proposed_to_remove,
-                observed_column="target_anchored_usage_for_selection",
+                observed_column="target_anchored_flip_count_for_selection",
                 adjusted_column="permutation_adjusted_usage_for_selection",
-                tie_breaker_columns=["target_anchored_usage_mean"],
+                tie_breaker_columns=["target_anchored_flip_count_mean"],
                 current_features=current_features,
                 min_usage_count=min_usage_count,
                 min_permutation_adjusted_usage=min_permutation_adjusted_usage,
@@ -250,16 +254,17 @@ def select_features_by_target_weighted_isotree_json_usage(
             )
             usage, permutation_result = _add_permutation_calibration(
                 usage,
-                observed_column="target_anchored_usage_for_selection",
+                observed_column="target_anchored_flip_count_for_selection",
                 null_usage_matrix=null_usage_matrix,
                 feature_names=current_features,
+                null_label="permutation_null_flip_count",
             )
             proposed_to_remove = _permutation_calibrated_removal_candidates(
                 usage,
                 raw_proposed_to_remove=raw_proposed_to_remove,
-                observed_column="target_anchored_usage_for_selection",
+                observed_column="target_anchored_flip_count_for_selection",
                 adjusted_column="permutation_adjusted_usage_for_selection",
-                tie_breaker_columns=["target_anchored_usage_mean"],
+                tie_breaker_columns=["target_anchored_flip_count_mean"],
                 current_features=current_features,
                 min_usage_count=min_usage_count,
                 min_permutation_adjusted_usage=min_permutation_adjusted_usage,
@@ -318,7 +323,7 @@ def select_features_by_target_weighted_isotree_json_usage(
         "original_features": original_features,
         "target_features": target_features,
         "task": task,
-        "method": "target_weighted_json_usage_ndim2",
+        "method": "target_weighted_json_flip_usage_ndim2",
         "target_draw_probability": target_draw_probability,
         "permutation_mode": permutation_mode,
     }
@@ -621,6 +626,286 @@ def _decoy_target_feature_name(feature):
     return f"__permuted_{feature}"
 
 
+def _anchored_flip_usage_from_isotree_json(model, *, X_aug, x_feature_names, target_feature_names):
+    trees = model.to_json(as_str=False)
+    if isinstance(trees, dict):
+        trees = [trees]
+
+    x_feature_names = list(x_feature_names)
+    counts = pd.Series(0, index=x_feature_names, dtype="int64")
+    X_aug = X_aug.reset_index(drop=True)
+    x_features = set(map(str, x_feature_names))
+    target_features = set(map(str, target_feature_names))
+    columns = set(map(str, X_aug.columns))
+    stats = {"n_extractable_splits": 0}
+
+    for tree in trees:
+        _accumulate_tree_flip_usage(
+            tree,
+            X_aug=X_aug,
+            active_rows=np.arange(len(X_aug)),
+            counts=counts,
+            x_features=x_features,
+            target_features=target_features,
+            columns=columns,
+            stats=stats,
+        )
+
+    if stats["n_extractable_splits"] == 0:
+        raise ValueError("Could not parse split coefficients and thresholds from IsoTree JSON.")
+
+    return counts.loc[x_feature_names].to_numpy(dtype=np.int64)
+
+
+def _accumulate_tree_flip_usage(tree, *, X_aug, active_rows, counts, x_features, target_features, columns, stats):
+    if not isinstance(tree, dict):
+        return
+
+    if _looks_like_flat_tree(tree):
+        for node in tree.values():
+            _accumulate_node_flip_usage(
+                node,
+                X_aug=X_aug,
+                active_rows=active_rows,
+                counts=counts,
+                x_features=x_features,
+                target_features=target_features,
+                columns=columns,
+                stats=stats,
+                route_children=False,
+            )
+        return
+
+    _accumulate_node_flip_usage(
+        tree,
+        X_aug=X_aug,
+        active_rows=active_rows,
+        counts=counts,
+        x_features=x_features,
+        target_features=target_features,
+        columns=columns,
+        stats=stats,
+        route_children=True,
+    )
+
+
+def _looks_like_flat_tree(tree):
+    if not tree:
+        return False
+    values = list(tree.values())
+    return values and all(isinstance(value, dict) for value in values)
+
+
+def _accumulate_node_flip_usage(
+    node,
+    *,
+    X_aug,
+    active_rows,
+    counts,
+    x_features,
+    target_features,
+    columns,
+    stats,
+    route_children,
+):
+    if not isinstance(node, dict) or len(active_rows) == 0:
+        return
+
+    split = _extract_oblique_split(node, columns=columns)
+    if split is None:
+        if route_children:
+            for child in _child_nodes(node):
+                _accumulate_node_flip_usage(
+                    child,
+                    X_aug=X_aug,
+                    active_rows=active_rows,
+                    counts=counts,
+                    x_features=x_features,
+                    target_features=target_features,
+                    columns=columns,
+                    stats=stats,
+                    route_children=True,
+                )
+        return
+
+    terms, threshold = split
+    stats["n_extractable_splits"] += 1
+    split_x_features = [feature for feature in terms if feature in x_features]
+    split_target_features = [feature for feature in terms if feature in target_features]
+    if split_x_features and split_target_features:
+        X_node = X_aug.iloc[active_rows]
+        values = _evaluate_split_terms(X_node, terms)
+        routed_left = values <= threshold
+        for feature in split_x_features:
+            counterfactual_values = values - terms[feature] * X_node[feature].to_numpy(dtype=float)
+            counterfactual_left = counterfactual_values <= threshold
+            counts.loc[feature] += int(np.count_nonzero(routed_left != counterfactual_left))
+
+    if not route_children:
+        return
+
+    children = _left_right_children(node)
+    if children is None:
+        for child in _child_nodes(node):
+            _accumulate_node_flip_usage(
+                child,
+                X_aug=X_aug,
+                active_rows=active_rows,
+                counts=counts,
+                x_features=x_features,
+                target_features=target_features,
+                columns=columns,
+                stats=stats,
+                route_children=True,
+            )
+        return
+
+    left_child, right_child = children
+    X_node = X_aug.iloc[active_rows]
+    routed_left = _evaluate_split_terms(X_node, terms) <= threshold
+    left_rows = active_rows[routed_left]
+    right_rows = active_rows[~routed_left]
+    _accumulate_node_flip_usage(
+        left_child,
+        X_aug=X_aug,
+        active_rows=left_rows,
+        counts=counts,
+        x_features=x_features,
+        target_features=target_features,
+        columns=columns,
+        stats=stats,
+        route_children=True,
+    )
+    _accumulate_node_flip_usage(
+        right_child,
+        X_aug=X_aug,
+        active_rows=right_rows,
+        counts=counts,
+        x_features=x_features,
+        target_features=target_features,
+        columns=columns,
+        stats=stats,
+        route_children=True,
+    )
+
+
+def _extract_oblique_split(node, *, columns):
+    terms = _extract_split_terms(node, columns=columns)
+    threshold = _extract_split_threshold(node)
+    if not terms or threshold is None:
+        return None
+    return terms, threshold
+
+
+def _extract_split_terms(node, *, columns):
+    feature_keys = ("features", "feature", "cols", "columns", "col", "column")
+    coef_keys = ("coefs", "coef", "coefficients", "weights", "weight")
+
+    for feature_key in feature_keys:
+        for coef_key in coef_keys:
+            if feature_key not in node or coef_key not in node:
+                continue
+            feature_value = node[feature_key]
+            coef_value = node[coef_key]
+            terms = _terms_from_feature_coef_values(feature_value, coef_value, columns=columns)
+            if terms:
+                return terms
+
+    for coef_key in coef_keys:
+        coef_value = node.get(coef_key)
+        if isinstance(coef_value, dict):
+            terms = {
+                str(feature): float(coef)
+                for feature, coef in coef_value.items()
+                if str(feature) in columns and _is_number(coef)
+            }
+            if terms:
+                return terms
+
+    for key in ("coef_by_col", "coef_by_column", "weights_by_col", "weights_by_column"):
+        value = node.get(key)
+        if isinstance(value, dict):
+            terms = {
+                str(feature): float(coef)
+                for feature, coef in value.items()
+                if str(feature) in columns and _is_number(coef)
+            }
+            if terms:
+                return terms
+
+    return None
+
+
+def _terms_from_feature_coef_values(feature_value, coef_value, *, columns):
+    if isinstance(feature_value, str) and _is_number(coef_value) and feature_value in columns:
+        return {feature_value: float(coef_value)}
+
+    if isinstance(feature_value, dict) and isinstance(coef_value, dict):
+        terms = {}
+        for key, feature in feature_value.items():
+            if key in coef_value and str(feature) in columns and _is_number(coef_value[key]):
+                terms[str(feature)] = float(coef_value[key])
+        return terms or None
+
+    if not isinstance(feature_value, (list, tuple)) or not isinstance(coef_value, (list, tuple)):
+        return None
+    if len(feature_value) != len(coef_value):
+        return None
+
+    terms = {}
+    for feature, coef in zip(feature_value, coef_value):
+        feature = str(feature)
+        if feature in columns and _is_number(coef):
+            terms[feature] = float(coef)
+    return terms or None
+
+
+def _extract_split_threshold(node):
+    for key in ("threshold", "split_point", "cutpoint", "cutoff", "t"):
+        value = node.get(key)
+        if _is_number(value):
+            return float(value)
+    return None
+
+
+def _evaluate_split_terms(X, terms):
+    values = np.zeros(len(X), dtype=float)
+    for feature, coef in terms.items():
+        values += coef * X[feature].to_numpy(dtype=float)
+    return values
+
+
+def _left_right_children(node):
+    child_key_pairs = (
+        ("left", "right"),
+        ("left_child", "right_child"),
+        ("lte", "gt"),
+        ("less", "greater"),
+        ("yes", "no"),
+        ("true", "false"),
+    )
+    for left_key, right_key in child_key_pairs:
+        left = node.get(left_key)
+        right = node.get(right_key)
+        if isinstance(left, dict) and isinstance(right, dict):
+            return left, right
+    return None
+
+
+def _child_nodes(node):
+    children = []
+    for value in node.values():
+        if isinstance(value, dict):
+            children.append(value)
+        elif isinstance(value, list):
+            children.extend(item for item in value if isinstance(item, dict))
+    return children
+
+
+def _is_number(value):
+    return isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(value)
+
+
 def _anchored_usage_from_isotree_json(model, *, x_feature_names, target_feature_names):
     trees = model.to_json(as_str=False)
     if isinstance(trees, dict):
@@ -760,8 +1045,9 @@ def _target_permutation_usage_matrix(
             )
             model.fit(X_aug, column_weights=column_weights)
             rows.append(
-                _anchored_usage_from_isotree_json(
+                _anchored_flip_usage_from_isotree_json(
                     model,
+                    X_aug=X_aug,
                     x_feature_names=current_features,
                     target_feature_names=target_features,
                 )
@@ -770,16 +1056,23 @@ def _target_permutation_usage_matrix(
     return np.vstack(rows)
 
 
-def _add_permutation_calibration(usage, *, observed_column, null_usage_matrix, feature_names):
+def _add_permutation_calibration(
+    usage,
+    *,
+    observed_column,
+    null_usage_matrix,
+    feature_names,
+    null_label="permutation_null_usage",
+):
     usage = usage.copy()
     null_mean = null_usage_matrix.mean(axis=0)
     null_std = null_usage_matrix.std(axis=0, ddof=0)
     null_frame = pd.DataFrame(
         {
             "feature": list(feature_names),
-            "permutation_null_usage_mean": null_mean,
-            "permutation_null_usage_std": null_std,
-            "permutation_null_usage_max": null_usage_matrix.max(axis=0),
+            f"{null_label}_mean": null_mean,
+            f"{null_label}_std": null_std,
+            f"{null_label}_max": null_usage_matrix.max(axis=0),
         }
     )
     empirical_p_values = {}
@@ -791,10 +1084,10 @@ def _add_permutation_calibration(usage, *, observed_column, null_usage_matrix, f
 
     usage = usage.merge(null_frame, on="feature", how="left")
     observed = usage[observed_column].to_numpy(dtype=float)
-    usage["permutation_adjusted_usage_for_selection"] = observed - usage["permutation_null_usage_mean"]
+    usage["permutation_adjusted_usage_for_selection"] = observed - usage[f"{null_label}_mean"]
     usage["permutation_usage_z_score"] = (
-        observed - usage["permutation_null_usage_mean"]
-    ) / (usage["permutation_null_usage_std"] + 1e-12)
+        observed - usage[f"{null_label}_mean"]
+    ) / (usage[f"{null_label}_std"] + 1e-12)
     usage["permutation_empirical_p_value"] = usage["feature"].map(empirical_p_values)
     usage = usage.sort_values(
         ["permutation_adjusted_usage_for_selection", observed_column],
@@ -805,6 +1098,7 @@ def _add_permutation_calibration(usage, *, observed_column, null_usage_matrix, f
         "n_null_fits": int(null_usage_matrix.shape[0]),
         "null_usage_mean_mean": float(null_mean.mean()),
         "null_usage_mean_max": float(null_mean.max()),
+        "null_label": null_label,
     }
 
 
@@ -815,20 +1109,22 @@ def _add_competitive_permutation_calibration(
     decoy_selection_usage,
     decoy_usage_matrix,
     feature_names,
+    observed_label="target_anchored_usage",
+    decoy_label="permutation_decoy_usage",
 ):
     usage = usage.copy()
     decoy_frame = pd.DataFrame(
         {
             "feature": list(feature_names),
-            "permutation_decoy_usage_for_selection": decoy_selection_usage,
-            "permutation_decoy_usage_mean": decoy_usage_matrix.mean(axis=0),
-            "permutation_decoy_usage_min": decoy_usage_matrix.min(axis=0),
-            "permutation_decoy_usage_max": decoy_usage_matrix.max(axis=0),
+            f"{decoy_label}_for_selection": decoy_selection_usage,
+            f"{decoy_label}_mean": decoy_usage_matrix.mean(axis=0),
+            f"{decoy_label}_min": decoy_usage_matrix.min(axis=0),
+            f"{decoy_label}_max": decoy_usage_matrix.max(axis=0),
         }
     )
     usage = usage.merge(decoy_frame, on="feature", how="left")
     observed = usage[observed_column].to_numpy(dtype=float)
-    decoy = usage["permutation_decoy_usage_for_selection"].to_numpy(dtype=float)
+    decoy = usage[f"{decoy_label}_for_selection"].to_numpy(dtype=float)
     usage["permutation_adjusted_usage_for_selection"] = observed - decoy
     usage["permutation_competitive_ratio"] = (observed - decoy) / (observed + decoy + 1e-12)
     usage = usage.sort_values(
@@ -840,6 +1136,8 @@ def _add_competitive_permutation_calibration(
         "n_competitive_refits": int(decoy_usage_matrix.shape[0]),
         "decoy_usage_mean_mean": float(decoy_usage_matrix.mean(axis=0).mean()),
         "decoy_usage_mean_max": float(decoy_usage_matrix.mean(axis=0).max()),
+        "observed_label": observed_label,
+        "decoy_label": decoy_label,
     }
 
 

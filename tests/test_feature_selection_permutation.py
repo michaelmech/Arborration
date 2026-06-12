@@ -4,8 +4,17 @@ import pandas as pd
 from arborration.feature_selection import (
     _add_competitive_permutation_calibration,
     _add_permutation_calibration,
+    _anchored_flip_usage_from_isotree_json,
     _make_competitive_augmented_column_weights,
 )
+
+
+class _FakeIsoTreeModel:
+    def __init__(self, tree):
+        self.tree = tree
+
+    def to_json(self, as_str=False):
+        return self.tree
 
 
 def test_permutation_calibration_aligns_null_usage_by_feature_name():
@@ -85,3 +94,27 @@ def test_competitive_column_weights_keep_total_target_probability_with_real_lean
     assert np.isclose(real_weight / (real_weight + decoy_weight), 0.60)
     assert real_weight > decoy_weight
     assert x_weight > real_weight + decoy_weight
+
+
+def test_target_anchored_flip_usage_counts_counterfactual_routing_changes():
+    X_aug = pd.DataFrame(
+        {
+            "x1": [2.0, -2.0, 0.2],
+            "x2": [3.0, 3.0, 3.0],
+            "__target__z": [0.0, 0.0, 0.0],
+        }
+    )
+    tree = {
+        "features": ["x1", "__target__z"],
+        "coefs": [1.0, 1.0],
+        "threshold": 0.0,
+    }
+
+    counts = _anchored_flip_usage_from_isotree_json(
+        _FakeIsoTreeModel(tree),
+        X_aug=X_aug,
+        x_feature_names=["x1", "x2"],
+        target_feature_names=["__target__z"],
+    )
+
+    assert counts.tolist() == [2, 0]
