@@ -19,6 +19,10 @@ def select_features_for_task(X, y, *, task, **kwargs):
         kwargs.pop("permutation_usage_margin", None)
         kwargs.pop("min_permutation_adjusted_usage", None)
         kwargs.pop("competitive_real_target_weight", None)
+        kwargs.pop("feature_attribution_mode", None)
+        kwargs.pop("leaf_signal_quantile", None)
+        kwargs.pop("leaf_min_samples", None)
+        kwargs.pop("leaf_depth_decay", None)
         return select_features_by_class_contrast_isotree_json_usage(X, y, **kwargs)
     if task == "regression":
         kwargs = dict(kwargs)
@@ -48,6 +52,10 @@ def select_features_by_target_weighted_isotree_json_usage(
     require_used_in_any_refit=True,
     target_draw_probability=0.25,
     regression_target_bins=10,
+    feature_attribution_mode="routing_flip",
+    leaf_signal_quantile=0.25,
+    leaf_min_samples=2,
+    leaf_depth_decay=0.0,
     random_state=42,
     nthreads=-1,
     min_features_to_keep=1,
@@ -73,6 +81,14 @@ def select_features_by_target_weighted_isotree_json_usage(
         raise ValueError("target_draw_probability must be between 0 and 1.")
     if ndim < 2:
         raise ValueError("This target-anchored method is intended for ndim >= 2.")
+    if feature_attribution_mode not in {"routing_flip", "leaf_backtrack"}:
+        raise ValueError("feature_attribution_mode must be 'routing_flip' or 'leaf_backtrack'.")
+    if not (0.0 < leaf_signal_quantile <= 1.0):
+        raise ValueError("leaf_signal_quantile must be in (0, 1].")
+    if leaf_min_samples < 1:
+        raise ValueError("leaf_min_samples must be at least 1.")
+    if leaf_depth_decay < 0:
+        raise ValueError("leaf_depth_decay must be nonnegative.")
     if score_tolerance < 0:
         raise ValueError("score_tolerance must be nonnegative.")
     _validate_permutation_params(
@@ -154,38 +170,48 @@ def select_features_by_target_weighted_isotree_json_usage(
             )
             model.fit(X_aug, column_weights=column_weights)
             usage_by_refit.append(
-                _anchored_flip_usage_from_isotree_json(
+                _target_anchored_attribution_from_isotree_json(
                     model,
                     X_aug=X_aug,
                     x_feature_names=current_features,
                     target_feature_names=target_features,
+                    feature_attribution_mode=feature_attribution_mode,
+                    leaf_signal_quantile=leaf_signal_quantile,
+                    leaf_min_samples=leaf_min_samples,
+                    leaf_depth_decay=leaf_depth_decay,
                 )
             )
             if decoy_features is not None:
                 decoy_usage_by_refit.append(
-                    _anchored_flip_usage_from_isotree_json(
+                    _target_anchored_attribution_from_isotree_json(
                         model,
                         X_aug=X_aug,
                         x_feature_names=current_features,
                         target_feature_names=decoy_features,
+                        feature_attribution_mode=feature_attribution_mode,
+                        signal_target_feature_names=decoy_features,
+                        leaf_signal_quantile=leaf_signal_quantile,
+                        leaf_min_samples=leaf_min_samples,
+                        leaf_depth_decay=leaf_depth_decay,
                     )
                 )
 
         usage_matrix = np.vstack(usage_by_refit)
         selection_usage = usage_matrix.max(axis=0) if require_used_in_any_refit else usage_matrix.sum(axis=0)
+        usage_label = _feature_attribution_usage_label(feature_attribution_mode)
         usage = (
             pd.DataFrame(
                 {
                     "feature": current_features,
-                    "target_anchored_flip_count_for_selection": selection_usage,
-                    "target_anchored_flip_count_mean": usage_matrix.mean(axis=0),
-                    "target_anchored_flip_count_min": usage_matrix.min(axis=0),
-                    "target_anchored_flip_count_max": usage_matrix.max(axis=0),
+                    f"{usage_label}_for_selection": selection_usage,
+                    f"{usage_label}_mean": usage_matrix.mean(axis=0),
+                    f"{usage_label}_min": usage_matrix.min(axis=0),
+                    f"{usage_label}_max": usage_matrix.max(axis=0),
                     "n_refits_used_with_target": (usage_matrix > 0).sum(axis=0),
                 }
             )
             .sort_values(
-                ["target_anchored_flip_count_for_selection", "target_anchored_flip_count_mean"],
+                [f"{usage_label}_for_selection", f"{usage_label}_mean"],
                 ascending=False,
             )
             .reset_index(drop=True)
@@ -193,8 +219,8 @@ def select_features_by_target_weighted_isotree_json_usage(
 
         raw_proposed_to_remove = _conservative_removal_candidates(
             usage,
-            usage_column="target_anchored_flip_count_for_selection",
-            tie_breaker_columns=["target_anchored_flip_count_mean"],
+            usage_column=f"{usage_label}_for_selection",
+            tie_breaker_columns=[f"{usage_label}_mean"],
             current_features=current_features,
             min_usage_count=min_usage_count,
             n_refits=n_refits,
@@ -213,19 +239,19 @@ def select_features_by_target_weighted_isotree_json_usage(
             )
             usage, permutation_result = _add_competitive_permutation_calibration(
                 usage,
-                observed_column="target_anchored_flip_count_for_selection",
+                observed_column=f"{usage_label}_for_selection",
                 decoy_selection_usage=decoy_selection_usage,
                 decoy_usage_matrix=decoy_usage_matrix,
                 feature_names=current_features,
-                observed_label="target_anchored_flip_count",
-                decoy_label="permutation_decoy_flip_count",
+                observed_label=usage_label,
+                decoy_label=f"permutation_decoy_{usage_label}",
             )
             proposed_to_remove = _permutation_calibrated_removal_candidates(
                 usage,
                 raw_proposed_to_remove=raw_proposed_to_remove,
-                observed_column="target_anchored_flip_count_for_selection",
+                observed_column=f"{usage_label}_for_selection",
                 adjusted_column="permutation_adjusted_usage_for_selection",
-                tie_breaker_columns=["target_anchored_flip_count_mean"],
+                tie_breaker_columns=[f"{usage_label}_mean"],
                 current_features=current_features,
                 min_usage_count=min_usage_count,
                 min_permutation_adjusted_usage=min_permutation_adjusted_usage,
@@ -251,20 +277,24 @@ def select_features_by_target_weighted_isotree_json_usage(
                 ndim=ndim,
                 nthreads=nthreads,
                 isotree_kwargs=isotree_kwargs,
+                feature_attribution_mode=feature_attribution_mode,
+                leaf_signal_quantile=leaf_signal_quantile,
+                leaf_min_samples=leaf_min_samples,
+                leaf_depth_decay=leaf_depth_decay,
             )
             usage, permutation_result = _add_permutation_calibration(
                 usage,
-                observed_column="target_anchored_flip_count_for_selection",
+                observed_column=f"{usage_label}_for_selection",
                 null_usage_matrix=null_usage_matrix,
                 feature_names=current_features,
-                null_label="permutation_null_flip_count",
+                null_label=f"permutation_null_{usage_label}",
             )
             proposed_to_remove = _permutation_calibrated_removal_candidates(
                 usage,
                 raw_proposed_to_remove=raw_proposed_to_remove,
-                observed_column="target_anchored_flip_count_for_selection",
+                observed_column=f"{usage_label}_for_selection",
                 adjusted_column="permutation_adjusted_usage_for_selection",
-                tie_breaker_columns=["target_anchored_flip_count_mean"],
+                tie_breaker_columns=[f"{usage_label}_mean"],
                 current_features=current_features,
                 min_usage_count=min_usage_count,
                 min_permutation_adjusted_usage=min_permutation_adjusted_usage,
@@ -296,6 +326,7 @@ def select_features_by_target_weighted_isotree_json_usage(
                 "target_draw_probability": target_draw_probability,
                 "target_features": target_features,
                 "permutation_mode": permutation_mode,
+                "feature_attribution_mode": feature_attribution_mode,
             }
         )
 
@@ -323,9 +354,10 @@ def select_features_by_target_weighted_isotree_json_usage(
         "original_features": original_features,
         "target_features": target_features,
         "task": task,
-        "method": "target_weighted_json_flip_usage_ndim2",
+        "method": f"target_weighted_json_{feature_attribution_mode}_usage_ndim2",
         "target_draw_probability": target_draw_probability,
         "permutation_mode": permutation_mode,
+        "feature_attribution_mode": feature_attribution_mode,
     }
     return X_raw[current_features], result
 
@@ -626,6 +658,47 @@ def _decoy_target_feature_name(feature):
     return f"__permuted_{feature}"
 
 
+def _feature_attribution_usage_label(feature_attribution_mode):
+    if feature_attribution_mode == "routing_flip":
+        return "target_anchored_flip_count"
+    if feature_attribution_mode == "leaf_backtrack":
+        return "target_leaf_backtrack_score"
+    raise ValueError("feature_attribution_mode must be 'routing_flip' or 'leaf_backtrack'.")
+
+
+def _target_anchored_attribution_from_isotree_json(
+    model,
+    *,
+    X_aug,
+    x_feature_names,
+    target_feature_names,
+    feature_attribution_mode,
+    signal_target_feature_names=None,
+    leaf_signal_quantile=0.25,
+    leaf_min_samples=2,
+    leaf_depth_decay=0.0,
+):
+    if feature_attribution_mode == "routing_flip":
+        return _anchored_flip_usage_from_isotree_json(
+            model,
+            X_aug=X_aug,
+            x_feature_names=x_feature_names,
+            target_feature_names=target_feature_names,
+        )
+    if feature_attribution_mode == "leaf_backtrack":
+        return _leaf_backtrack_usage_from_isotree_json(
+            model,
+            X_aug=X_aug,
+            x_feature_names=x_feature_names,
+            target_feature_names=target_feature_names,
+            signal_target_feature_names=signal_target_feature_names or target_feature_names,
+            leaf_signal_quantile=leaf_signal_quantile,
+            leaf_min_samples=leaf_min_samples,
+            leaf_depth_decay=leaf_depth_decay,
+        )
+    raise ValueError("feature_attribution_mode must be 'routing_flip' or 'leaf_backtrack'.")
+
+
 def _anchored_flip_usage_from_isotree_json(model, *, X_aug, x_feature_names, target_feature_names):
     trees = model.to_json(as_str=False)
     if isinstance(trees, dict):
@@ -655,6 +728,176 @@ def _anchored_flip_usage_from_isotree_json(model, *, X_aug, x_feature_names, tar
         raise ValueError("Could not parse split coefficients and thresholds from IsoTree JSON.")
 
     return counts.loc[x_feature_names].to_numpy(dtype=np.int64)
+
+
+def _leaf_backtrack_usage_from_isotree_json(
+    model,
+    *,
+    X_aug,
+    x_feature_names,
+    target_feature_names,
+    signal_target_feature_names,
+    leaf_signal_quantile=0.25,
+    leaf_min_samples=2,
+    leaf_depth_decay=0.0,
+):
+    trees = model.to_json(as_str=False)
+    if isinstance(trees, dict):
+        trees = [trees]
+
+    x_feature_names = list(x_feature_names)
+    X_aug = X_aug.reset_index(drop=True)
+    x_features = set(map(str, x_feature_names))
+    target_features = set(map(str, target_feature_names))
+    signal_target_feature_names = list(signal_target_feature_names)
+    columns = set(map(str, X_aug.columns))
+    stats = {"n_extractable_splits": 0}
+    leaf_records = []
+
+    for tree in trees:
+        _collect_tree_leaf_paths(
+            tree,
+            X_aug=X_aug,
+            active_rows=np.arange(len(X_aug)),
+            path=[],
+            leaf_records=leaf_records,
+            x_features=x_features,
+            target_features=target_features,
+            signal_target_feature_names=signal_target_feature_names,
+            columns=columns,
+            stats=stats,
+            leaf_min_samples=leaf_min_samples,
+        )
+
+    if stats["n_extractable_splits"] == 0:
+        raise ValueError("Could not parse split coefficients and thresholds from IsoTree JSON.")
+
+    eligible = [leaf for leaf in leaf_records if leaf["n_samples"] >= leaf_min_samples]
+    counts = pd.Series(0.0, index=x_feature_names, dtype="float64")
+    if not eligible:
+        return counts.loc[x_feature_names].to_numpy(dtype=float)
+
+    variances = np.array([leaf["target_variance"] for leaf in eligible], dtype=float)
+    signal_threshold = float(np.quantile(variances, leaf_signal_quantile))
+    for leaf in eligible:
+        if leaf["target_variance"] > signal_threshold:
+            continue
+        leaf_weight = float(leaf["n_samples"])
+        for depth, terms in leaf["path"]:
+            depth_weight = 1.0 / (1.0 + leaf_depth_decay * float(depth))
+            for feature, coef in terms.items():
+                if feature in x_features:
+                    counts.loc[feature] += abs(float(coef)) * leaf_weight * depth_weight
+
+    return counts.loc[x_feature_names].to_numpy(dtype=float)
+
+
+def _collect_tree_leaf_paths(
+    tree,
+    *,
+    X_aug,
+    active_rows,
+    path,
+    leaf_records,
+    x_features,
+    target_features,
+    signal_target_feature_names,
+    columns,
+    stats,
+    leaf_min_samples,
+):
+    if not isinstance(tree, dict):
+        return
+
+    if _looks_like_flat_tree(tree):
+        raise ValueError("Leaf backtracking requires nested child nodes in IsoTree JSON.")
+
+    _collect_node_leaf_paths(
+        tree,
+        X_aug=X_aug,
+        active_rows=active_rows,
+        path=path,
+        leaf_records=leaf_records,
+        x_features=x_features,
+        target_features=target_features,
+        signal_target_feature_names=signal_target_feature_names,
+        columns=columns,
+        stats=stats,
+        leaf_min_samples=leaf_min_samples,
+        depth=0,
+    )
+
+
+def _collect_node_leaf_paths(
+    node,
+    *,
+    X_aug,
+    active_rows,
+    path,
+    leaf_records,
+    x_features,
+    target_features,
+    signal_target_feature_names,
+    columns,
+    stats,
+    leaf_min_samples,
+    depth,
+):
+    if not isinstance(node, dict) or len(active_rows) == 0:
+        return
+
+    split = _extract_oblique_split(node, columns=columns)
+    children = _left_right_children(node)
+    if split is None or children is None:
+        if len(active_rows) >= leaf_min_samples:
+            y_leaf = X_aug.iloc[active_rows][signal_target_feature_names].to_numpy(dtype=float)
+            leaf_records.append(
+                {
+                    "n_samples": int(len(active_rows)),
+                    "target_variance": float(np.mean(np.var(y_leaf, axis=0))),
+                    "path": list(path),
+                }
+            )
+        return
+
+    terms, threshold = split
+    stats["n_extractable_splits"] += 1
+    path_terms = {feature: coef for feature, coef in terms.items() if feature in x_features}
+    path_next = path + [(depth, path_terms)] if path_terms else path
+
+    left_child, right_child = children
+    X_node = X_aug.iloc[active_rows]
+    routed_left = _evaluate_split_terms(X_node, terms) <= threshold
+    left_rows = active_rows[routed_left]
+    right_rows = active_rows[~routed_left]
+    _collect_node_leaf_paths(
+        left_child,
+        X_aug=X_aug,
+        active_rows=left_rows,
+        path=path_next,
+        leaf_records=leaf_records,
+        x_features=x_features,
+        target_features=target_features,
+        signal_target_feature_names=signal_target_feature_names,
+        columns=columns,
+        stats=stats,
+        leaf_min_samples=leaf_min_samples,
+        depth=depth + 1,
+    )
+    _collect_node_leaf_paths(
+        right_child,
+        X_aug=X_aug,
+        active_rows=right_rows,
+        path=path_next,
+        leaf_records=leaf_records,
+        x_features=x_features,
+        target_features=target_features,
+        signal_target_feature_names=signal_target_feature_names,
+        columns=columns,
+        stats=stats,
+        leaf_min_samples=leaf_min_samples,
+        depth=depth + 1,
+    )
 
 
 def _accumulate_tree_flip_usage(tree, *, X_aug, active_rows, counts, x_features, target_features, columns, stats):
@@ -1009,6 +1252,10 @@ def _target_permutation_usage_matrix(
     ndim,
     nthreads,
     isotree_kwargs,
+    feature_attribution_mode="routing_flip",
+    leaf_signal_quantile=0.25,
+    leaf_min_samples=2,
+    leaf_depth_decay=0.0,
 ):
     rows = []
     y_values = pd.Series(y).reset_index(drop=True).to_numpy()
@@ -1045,11 +1292,15 @@ def _target_permutation_usage_matrix(
             )
             model.fit(X_aug, column_weights=column_weights)
             rows.append(
-                _anchored_flip_usage_from_isotree_json(
+                _target_anchored_attribution_from_isotree_json(
                     model,
                     X_aug=X_aug,
                     x_feature_names=current_features,
                     target_feature_names=target_features,
+                    feature_attribution_mode=feature_attribution_mode,
+                    leaf_signal_quantile=leaf_signal_quantile,
+                    leaf_min_samples=leaf_min_samples,
+                    leaf_depth_decay=leaf_depth_decay,
                 )
             )
 
