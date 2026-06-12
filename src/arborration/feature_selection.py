@@ -810,7 +810,20 @@ def _collect_tree_leaf_paths(
         return
 
     if _looks_like_flat_tree(tree):
-        raise ValueError("Leaf backtracking requires nested child nodes in IsoTree JSON.")
+        _collect_flat_tree_leaf_paths(
+            tree,
+            X_aug=X_aug,
+            active_rows=active_rows,
+            path=path,
+            leaf_records=leaf_records,
+            x_features=x_features,
+            target_features=target_features,
+            signal_target_feature_names=signal_target_feature_names,
+            columns=columns,
+            stats=stats,
+            leaf_min_samples=leaf_min_samples,
+        )
+        return
 
     _collect_node_leaf_paths(
         tree,
@@ -825,6 +838,112 @@ def _collect_tree_leaf_paths(
         stats=stats,
         leaf_min_samples=leaf_min_samples,
         depth=0,
+    )
+
+
+def _collect_flat_tree_leaf_paths(
+    tree,
+    *,
+    X_aug,
+    active_rows,
+    path,
+    leaf_records,
+    x_features,
+    target_features,
+    signal_target_feature_names,
+    columns,
+    stats,
+    leaf_min_samples,
+):
+    root_key = _flat_tree_root_key(tree)
+    _collect_flat_node_leaf_paths(
+        tree,
+        node_key=root_key,
+        X_aug=X_aug,
+        active_rows=active_rows,
+        path=path,
+        leaf_records=leaf_records,
+        x_features=x_features,
+        target_features=target_features,
+        signal_target_feature_names=signal_target_feature_names,
+        columns=columns,
+        stats=stats,
+        leaf_min_samples=leaf_min_samples,
+        depth=0,
+    )
+
+
+def _collect_flat_node_leaf_paths(
+    tree,
+    *,
+    node_key,
+    X_aug,
+    active_rows,
+    path,
+    leaf_records,
+    x_features,
+    target_features,
+    signal_target_feature_names,
+    columns,
+    stats,
+    leaf_min_samples,
+    depth,
+):
+    node = tree.get(str(node_key), tree.get(node_key))
+    if not isinstance(node, dict) or len(active_rows) == 0:
+        return
+
+    split = _extract_oblique_split(node, columns=columns)
+    children = _left_right_child_refs(node, tree)
+    if split is None or children is None:
+        if len(active_rows) >= leaf_min_samples:
+            y_leaf = X_aug.iloc[active_rows][signal_target_feature_names].to_numpy(dtype=float)
+            leaf_records.append(
+                {
+                    "n_samples": int(len(active_rows)),
+                    "target_variance": float(np.mean(np.var(y_leaf, axis=0))),
+                    "path": list(path),
+                }
+            )
+        return
+
+    terms, threshold = split
+    stats["n_extractable_splits"] += 1
+    path_terms = {feature: coef for feature, coef in terms.items() if feature in x_features}
+    path_next = path + [(depth, path_terms)] if path_terms else path
+
+    left_key, right_key = children
+    X_node = X_aug.iloc[active_rows]
+    routed_left = _evaluate_split_terms(X_node, terms) <= threshold
+    _collect_flat_node_leaf_paths(
+        tree,
+        node_key=left_key,
+        X_aug=X_aug,
+        active_rows=active_rows[routed_left],
+        path=path_next,
+        leaf_records=leaf_records,
+        x_features=x_features,
+        target_features=target_features,
+        signal_target_feature_names=signal_target_feature_names,
+        columns=columns,
+        stats=stats,
+        leaf_min_samples=leaf_min_samples,
+        depth=depth + 1,
+    )
+    _collect_flat_node_leaf_paths(
+        tree,
+        node_key=right_key,
+        X_aug=X_aug,
+        active_rows=active_rows[~routed_left],
+        path=path_next,
+        leaf_records=leaf_records,
+        x_features=x_features,
+        target_features=target_features,
+        signal_target_feature_names=signal_target_feature_names,
+        columns=columns,
+        stats=stats,
+        leaf_min_samples=leaf_min_samples,
+        depth=depth + 1,
     )
 
 
@@ -905,18 +1024,16 @@ def _accumulate_tree_flip_usage(tree, *, X_aug, active_rows, counts, x_features,
         return
 
     if _looks_like_flat_tree(tree):
-        for node in tree.values():
-            _accumulate_node_flip_usage(
-                node,
-                X_aug=X_aug,
-                active_rows=active_rows,
-                counts=counts,
-                x_features=x_features,
-                target_features=target_features,
-                columns=columns,
-                stats=stats,
-                route_children=False,
-            )
+        _accumulate_flat_tree_flip_usage(
+            tree,
+            X_aug=X_aug,
+            active_rows=active_rows,
+            counts=counts,
+            x_features=x_features,
+            target_features=target_features,
+            columns=columns,
+            stats=stats,
+        )
         return
 
     _accumulate_node_flip_usage(
@@ -937,6 +1054,102 @@ def _looks_like_flat_tree(tree):
         return False
     values = list(tree.values())
     return values and all(isinstance(value, dict) for value in values)
+
+
+def _flat_tree_root_key(tree):
+    if "0" in tree:
+        return "0"
+    try:
+        return min(tree, key=lambda key: int(key))
+    except (TypeError, ValueError):
+        return next(iter(tree))
+
+
+def _accumulate_flat_tree_flip_usage(
+    tree,
+    *,
+    X_aug,
+    active_rows,
+    counts,
+    x_features,
+    target_features,
+    columns,
+    stats,
+):
+    root_key = _flat_tree_root_key(tree)
+    _accumulate_flat_node_flip_usage(
+        tree,
+        node_key=root_key,
+        X_aug=X_aug,
+        active_rows=active_rows,
+        counts=counts,
+        x_features=x_features,
+        target_features=target_features,
+        columns=columns,
+        stats=stats,
+    )
+
+
+def _accumulate_flat_node_flip_usage(
+    tree,
+    *,
+    node_key,
+    X_aug,
+    active_rows,
+    counts,
+    x_features,
+    target_features,
+    columns,
+    stats,
+):
+    node = tree.get(str(node_key), tree.get(node_key))
+    if not isinstance(node, dict) or len(active_rows) == 0:
+        return
+
+    split = _extract_oblique_split(node, columns=columns)
+    children = _left_right_child_refs(node, tree)
+    if split is None:
+        return
+
+    terms, threshold = split
+    stats["n_extractable_splits"] += 1
+    split_x_features = [feature for feature in terms if feature in x_features]
+    split_target_features = [feature for feature in terms if feature in target_features]
+    X_node = X_aug.iloc[active_rows]
+    values = _evaluate_split_terms(X_node, terms)
+    routed_left = values <= threshold
+    if split_x_features and split_target_features:
+        for feature in split_x_features:
+            counterfactual_values = values - terms[feature] * X_node[feature].to_numpy(dtype=float)
+            counterfactual_left = counterfactual_values <= threshold
+            counts.loc[feature] += int(np.count_nonzero(routed_left != counterfactual_left))
+
+    if children is None:
+        return
+
+    left_key, right_key = children
+    _accumulate_flat_node_flip_usage(
+        tree,
+        node_key=left_key,
+        X_aug=X_aug,
+        active_rows=active_rows[routed_left],
+        counts=counts,
+        x_features=x_features,
+        target_features=target_features,
+        columns=columns,
+        stats=stats,
+    )
+    _accumulate_flat_node_flip_usage(
+        tree,
+        node_key=right_key,
+        X_aug=X_aug,
+        active_rows=active_rows[~routed_left],
+        counts=counts,
+        x_features=x_features,
+        target_features=target_features,
+        columns=columns,
+        stats=stats,
+    )
 
 
 def _accumulate_node_flip_usage(
@@ -1033,26 +1246,76 @@ def _accumulate_node_flip_usage(
 
 
 def _extract_oblique_split(node, *, columns):
-    terms = _extract_split_terms(node, columns=columns)
+    extracted = _extract_split_terms_and_offset(node, columns=columns)
     threshold = _extract_split_threshold(node)
-    if not terms or threshold is None:
+    if extracted is None or threshold is None:
         return None
+    terms, threshold_offset = extracted
+    threshold = threshold + threshold_offset
     return terms, threshold
 
 
 def _extract_split_terms(node, *, columns):
-    feature_keys = ("features", "feature", "cols", "columns", "col", "column")
-    coef_keys = ("coefs", "coef", "coefficients", "weights", "weight")
+    extracted = _extract_split_terms_and_offset(node, columns=columns)
+    if extracted is None:
+        return None
+    terms, _ = extracted
+    return terms
+
+
+def _extract_split_terms_and_offset(node, *, columns):
+    feature_keys = (
+        "features",
+        "feature",
+        "feature_name",
+        "cols",
+        "columns",
+        "col",
+        "column",
+        "col_name",
+        "column_name",
+        "variable",
+        "var",
+        "name",
+    )
+    coef_keys = ("coefs", "coef", "coefficients", "coefficient", "weights", "weight", "w")
+    center_keys = ("centering", "center", "mean", "avg", "average")
+
+    if isinstance(node, list):
+        combined_terms = {}
+        combined_offset = 0.0
+        for item in node:
+            extracted = _extract_split_terms_and_offset(item, columns=columns)
+            if extracted is None:
+                continue
+            terms, offset = extracted
+            for feature, coef in terms.items():
+                combined_terms[feature] = combined_terms.get(feature, 0.0) + coef
+            combined_offset += offset
+        if combined_terms:
+            return combined_terms, combined_offset
+        return None
+
+    if not isinstance(node, dict):
+        return None
 
     for feature_key in feature_keys:
         for coef_key in coef_keys:
             if feature_key not in node or coef_key not in node:
                 continue
-            feature_value = node[feature_key]
-            coef_value = node[coef_key]
-            terms = _terms_from_feature_coef_values(feature_value, coef_value, columns=columns)
-            if terms:
-                return terms
+            center_value = None
+            for center_key in center_keys:
+                if center_key in node:
+                    center_value = node[center_key]
+                    break
+            extracted = _terms_from_feature_coef_values(
+                node[feature_key],
+                node[coef_key],
+                center_value=center_value,
+                columns=columns,
+            )
+            if extracted is not None:
+                return extracted
 
     for coef_key in coef_keys:
         coef_value = node.get(coef_key)
@@ -1063,7 +1326,7 @@ def _extract_split_terms(node, *, columns):
                 if str(feature) in columns and _is_number(coef)
             }
             if terms:
-                return terms
+                return terms, 0.0
 
     for key in ("coef_by_col", "coef_by_column", "weights_by_col", "weights_by_column"):
         value = node.get(key)
@@ -1074,21 +1337,34 @@ def _extract_split_terms(node, *, columns):
                 if str(feature) in columns and _is_number(coef)
             }
             if terms:
-                return terms
+                return terms, 0.0
+
+    for key, value in node.items():
+        if key in _NODE_CHILD_KEYS:
+            continue
+        extracted = _extract_split_terms_and_offset(value, columns=columns)
+        if extracted is not None:
+            return extracted
 
     return None
 
 
-def _terms_from_feature_coef_values(feature_value, coef_value, *, columns):
+def _terms_from_feature_coef_values(feature_value, coef_value, *, center_value=None, columns):
     if isinstance(feature_value, str) and _is_number(coef_value) and feature_value in columns:
-        return {feature_value: float(coef_value)}
+        coef = float(coef_value)
+        center = float(center_value) if _is_number(center_value) else 0.0
+        return {feature_value: coef}, coef * center
 
     if isinstance(feature_value, dict) and isinstance(coef_value, dict):
         terms = {}
+        offset = 0.0
         for key, feature in feature_value.items():
             if key in coef_value and str(feature) in columns and _is_number(coef_value[key]):
-                terms[str(feature)] = float(coef_value[key])
-        return terms or None
+                coef = float(coef_value[key])
+                terms[str(feature)] = coef
+                if isinstance(center_value, dict) and key in center_value and _is_number(center_value[key]):
+                    offset += coef * float(center_value[key])
+        return (terms, offset) if terms else None
 
     if not isinstance(feature_value, (list, tuple)) or not isinstance(coef_value, (list, tuple)):
         return None
@@ -1096,11 +1372,18 @@ def _terms_from_feature_coef_values(feature_value, coef_value, *, columns):
         return None
 
     terms = {}
-    for feature, coef in zip(feature_value, coef_value):
+    offset = 0.0
+    center_values = center_value if isinstance(center_value, (list, tuple)) else [0.0] * len(feature_value)
+    if len(center_values) != len(feature_value):
+        center_values = [0.0] * len(feature_value)
+    for feature, coef, center in zip(feature_value, coef_value, center_values):
         feature = str(feature)
         if feature in columns and _is_number(coef):
-            terms[feature] = float(coef)
-    return terms or None
+            coef = float(coef)
+            terms[feature] = coef
+            if _is_number(center):
+                offset += coef * float(center)
+    return (terms, offset) if terms else None
 
 
 def _extract_split_threshold(node):
@@ -1118,20 +1401,59 @@ def _evaluate_split_terms(X, terms):
     return values
 
 
+_NODE_CHILD_KEY_PAIRS = (
+    ("left", "right"),
+    ("left_child", "right_child"),
+    ("left_node", "right_node"),
+    ("lte", "gt"),
+    ("leq", "gt"),
+    ("less", "greater"),
+    ("yes", "no"),
+    ("then", "else"),
+    ("if_yes", "if_no"),
+    ("if_true", "if_false"),
+    ("true", "false"),
+    ("node_left", "node_right"),
+)
+_NODE_CHILD_KEYS = {key for pair in _NODE_CHILD_KEY_PAIRS for key in pair}
+
+
 def _left_right_children(node):
-    child_key_pairs = (
-        ("left", "right"),
-        ("left_child", "right_child"),
-        ("lte", "gt"),
-        ("less", "greater"),
-        ("yes", "no"),
-        ("true", "false"),
-    )
-    for left_key, right_key in child_key_pairs:
+    for left_key, right_key in _NODE_CHILD_KEY_PAIRS:
         left = node.get(left_key)
         right = node.get(right_key)
         if isinstance(left, dict) and isinstance(right, dict):
             return left, right
+    return None
+
+
+def _left_right_child_refs(node, tree):
+    for left_key, right_key in _NODE_CHILD_KEY_PAIRS:
+        if left_key not in node or right_key not in node:
+            continue
+        left = _normalize_child_ref(node[left_key], tree)
+        right = _normalize_child_ref(node[right_key], tree)
+        if left is not None and right is not None:
+            return left, right
+    return None
+
+
+def _normalize_child_ref(value, tree):
+    if isinstance(value, dict):
+        for key, node in tree.items():
+            if node is value:
+                return key
+        return None
+    if isinstance(value, (str, int, np.integer)):
+        key = str(value)
+        if key in tree:
+            return key
+        if value in tree:
+            return value
+    if isinstance(value, float) and value.is_integer():
+        key = str(int(value))
+        if key in tree:
+            return key
     return None
 
 
