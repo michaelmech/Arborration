@@ -5,6 +5,7 @@ from arborration.feature_selection import (
     _add_competitive_permutation_calibration,
     _add_permutation_calibration,
     _anchored_flip_usage_from_isotree_json,
+    _leaf_backtrack_usage_from_isotree_json,
     _make_competitive_augmented_column_weights,
 )
 
@@ -118,3 +119,32 @@ def test_target_anchored_flip_usage_counts_counterfactual_routing_changes():
     )
 
     assert counts.tolist() == [2, 0]
+
+
+def test_leaf_backtrack_usage_credits_paths_to_low_variance_target_leaves():
+    X_aug = pd.DataFrame(
+        {
+            "x1": [-2.0, -1.0, 1.0, 2.0],
+            "x2": [0.0, 0.0, 0.0, 0.0],
+            "__target__z": [0.0, 0.0, 0.0, 10.0],
+        }
+    )
+    tree = {
+        "features": ["x1", "__target__z"],
+        "coefs": [1.0, 0.0],
+        "threshold": 0.0,
+        "left": {},
+        "right": {},
+    }
+
+    scores = _leaf_backtrack_usage_from_isotree_json(
+        _FakeIsoTreeModel(tree),
+        X_aug=X_aug,
+        x_feature_names=["x1", "x2"],
+        target_feature_names=["__target__z"],
+        signal_target_feature_names=["__target__z"],
+        leaf_signal_quantile=0.5,
+        leaf_min_samples=1,
+    )
+
+    assert scores.tolist() == [2.0, 0.0]
