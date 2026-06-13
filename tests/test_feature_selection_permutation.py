@@ -153,6 +153,50 @@ def test_target_anchored_flip_usage_routes_flat_isotree_json():
     assert counts.tolist() == [2, 0]
 
 
+def test_target_anchored_flip_usage_routes_isotree_export_json_keys():
+    X_aug = pd.DataFrame(
+        {
+            "x1": [2.0, -2.0, 0.2],
+            "x2": [3.0, 3.0, 3.0],
+            "__target__z": [0.0, 0.0, 0.0],
+        }
+    )
+    tree = {
+        "0": {
+            "terminal": "no",
+            "node_when_condition_is_met": 1,
+            "node_when_condition_is_not_met": 2,
+            "combination": [
+                {
+                    "column": "x1",
+                    "column_type": "numeric",
+                    "coefficient": 1.0,
+                    "centering": 0.0,
+                },
+                {
+                    "column": "__target__z",
+                    "column_type": "numeric",
+                    "coefficient": 1.0,
+                    "centering": 0.0,
+                },
+            ],
+            "condition": "<=",
+            "value": 0.0,
+        },
+        "1": {"terminal": "yes", "score": 1.0, "leaf": 0},
+        "2": {"terminal": "yes", "score": 1.0, "leaf": 1},
+    }
+
+    counts = _anchored_flip_usage_from_isotree_json(
+        _FakeIsoTreeModel(tree),
+        X_aug=X_aug,
+        x_feature_names=["x1", "x2"],
+        target_feature_names=["__target__z"],
+    )
+
+    assert counts.tolist() == [2, 0]
+
+
 def test_leaf_backtrack_usage_credits_paths_to_low_variance_target_leaves():
     X_aug = pd.DataFrame(
         {
@@ -202,6 +246,53 @@ def test_leaf_backtrack_usage_routes_flat_isotree_json():
         },
         "1": {},
         "2": {},
+    }
+
+    scores = _leaf_backtrack_usage_from_isotree_json(
+        _FakeIsoTreeModel(tree),
+        X_aug=X_aug,
+        x_feature_names=["x1", "x2"],
+        target_feature_names=["__target__z"],
+        signal_target_feature_names=["__target__z"],
+        leaf_signal_quantile=0.5,
+        leaf_min_samples=1,
+    )
+
+    assert scores.tolist() == [2.0, 0.0]
+
+
+def test_leaf_backtrack_usage_routes_isotree_export_json_keys():
+    X_aug = pd.DataFrame(
+        {
+            "x1": [-2.0, -1.0, 1.0, 2.0],
+            "x2": [0.0, 0.0, 0.0, 0.0],
+            "__target__z": [0.0, 0.0, 0.0, 10.0],
+        }
+    )
+    tree = {
+        "0": {
+            "terminal": "no",
+            "node_when_condition_is_met": 1,
+            "node_when_condition_is_not_met": 2,
+            "combination": [
+                {
+                    "column": "x1",
+                    "column_type": "numeric",
+                    "coefficient": 1.0,
+                    "centering": 0.0,
+                },
+                {
+                    "column": "__target__z",
+                    "column_type": "numeric",
+                    "coefficient": 0.0,
+                    "centering": 0.0,
+                },
+            ],
+            "condition": "<=",
+            "value": 0.0,
+        },
+        "1": {"terminal": "yes", "score": 1.0, "leaf": 0},
+        "2": {"terminal": "yes", "score": 1.0, "leaf": 1},
     }
 
     scores = _leaf_backtrack_usage_from_isotree_json(

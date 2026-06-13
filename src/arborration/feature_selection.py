@@ -1387,7 +1387,7 @@ def _terms_from_feature_coef_values(feature_value, coef_value, *, center_value=N
 
 
 def _extract_split_threshold(node):
-    for key in ("threshold", "split_point", "cutpoint", "cutoff", "t"):
+    for key in ("threshold", "split_point", "cutpoint", "cutoff", "value", "t"):
         value = node.get(key)
         if _is_number(value):
             return float(value)
@@ -1402,6 +1402,7 @@ def _evaluate_split_terms(X, terms):
 
 
 _NODE_CHILD_KEY_PAIRS = (
+    ("node_when_condition_is_met", "node_when_condition_is_not_met"),
     ("left", "right"),
     ("left_child", "right_child"),
     ("left_node", "right_node"),
