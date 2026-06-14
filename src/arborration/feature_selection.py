@@ -705,6 +705,136 @@ def select_features_by_target_weighted_isotree_json_usage(
     return X_raw[current_features], result
 
 
+def select_features_by_isotree_structural_redundancy(
+    X,
+    y=None,
+    *,
+    ntrees=100,
+    sample_size=256,
+    ndim=2,
+    random_state=42,
+    nthreads=-1,
+    redundancy_mode="substitution",
+    linkage_method="average",
+    cluster_distance_threshold=0.5,
+    score_mode="auto",
+    min_features_to_keep=1,
+    standardize_X=True,
+    depth_decay=0.0,
+    min_leaf_samples=1,
+    isotree_kwargs=None,
+    verbose=True,
+):
+    """Prune structurally redundant features using IsoTree branch-path clustering."""
+    if redundancy_mode not in {"substitution", "cooccurrence"}:
+        raise ValueError("redundancy_mode must be 'substitution' or 'cooccurrence'.")
+    if cluster_distance_threshold < 0:
+        raise ValueError("cluster_distance_threshold must be nonnegative.")
+    if int(min_features_to_keep) < 1:
+        raise ValueError("min_features_to_keep must be at least 1.")
+    if depth_decay < 0:
+        raise ValueError("depth_decay must be nonnegative.")
+    if int(min_leaf_samples) < 1:
+        raise ValueError("min_leaf_samples must be at least 1.")
+
+    isotree_kwargs = isotree_kwargs or {}
+    X_raw = _to_frame(X)
+    if X_raw.shape[1] < 2:
+        feature_names = list(X_raw.columns)
+        result = {
+            "selected_features": feature_names,
+            "removed_features": [],
+            "clusters": {1: feature_names},
+            "cluster_winners": {1: feature_names[0]} if feature_names else {},
+            "feature_scores": pd.DataFrame(
+                {"feature": feature_names, "score": [1.0] * len(feature_names)}
+            ),
+            "distance_matrix": pd.DataFrame(
+                np.zeros((len(feature_names), len(feature_names))),
+                index=feature_names,
+                columns=feature_names,
+            ),
+            "linkage_matrix": None,
+            "method": "isotree_structural_redundancy",
+            "redundancy_mode": redundancy_mode,
+            "score_mode": "trivial",
+        }
+        return X_raw[feature_names], result
+
+    try:
+        from scipy.cluster.hierarchy import fcluster, linkage
+        from scipy.spatial.distance import squareform
+    except ImportError as exc:
+        raise ImportError(
+            "select_features_by_isotree_structural_redundancy requires scipy."
+        ) from exc
+
+    X_work = _standardize_frame(X_raw) if standardize_X else X_raw.astype(float).copy()
+    feature_names = list(X_work.columns)
+    model = IsolationForest(
+        ntrees=ntrees,
+        sample_size=min(sample_size, len(X_work)),
+        ndim=ndim,
+        missing_action="fail",
+        penalize_range=False,
+        random_seed=random_state,
+        nthreads=nthreads,
+        **isotree_kwargs,
+    )
+    model.fit(X_work)
+
+    distance, stats = _isotree_structural_distance_matrix(
+        model,
+        X=X_work.reset_index(drop=True),
+        feature_names=feature_names,
+        redundancy_mode=redundancy_mode,
+        depth_decay=depth_decay,
+        min_leaf_samples=min_leaf_samples,
+    )
+    condensed = squareform(distance, checks=False)
+    linkage_matrix = linkage(condensed, method=linkage_method)
+    labels = fcluster(linkage_matrix, t=cluster_distance_threshold, criterion="distance")
+
+    feature_scores, resolved_score_mode = _structural_redundancy_feature_scores(
+        X_work,
+        y,
+        feature_names=feature_names,
+        usage=stats["usage"],
+        score_mode=score_mode,
+        random_state=random_state,
+    )
+    selected_features, removed_features, clusters, winners = _select_cluster_winners(
+        feature_names,
+        labels,
+        feature_scores,
+        min_features_to_keep=min_features_to_keep,
+    )
+
+    if verbose:
+        print(
+            "isotree structural redundancy | "
+            f"features={len(feature_names)} | clusters={len(clusters)} | "
+            f"selected={len(selected_features)} | mode={redundancy_mode}"
+        )
+
+    result = {
+        "selected_features": selected_features,
+        "removed_features": removed_features,
+        "clusters": clusters,
+        "cluster_winners": winners,
+        "feature_scores": feature_scores,
+        "distance_matrix": pd.DataFrame(distance, index=feature_names, columns=feature_names),
+        "linkage_matrix": linkage_matrix,
+        "path_stats": stats,
+        "method": "isotree_structural_redundancy",
+        "redundancy_mode": redundancy_mode,
+        "linkage_method": linkage_method,
+        "cluster_distance_threshold": cluster_distance_threshold,
+        "score_mode": resolved_score_mode,
+    }
+    return X_raw[selected_features], result
+
+
 def select_features_by_class_contrast_isotree_json_usage(
     X,
     y,
@@ -999,6 +1129,307 @@ def _make_permuted_decoy_target_frame(
 
 def _decoy_target_feature_name(feature):
     return f"__permuted_{feature}"
+
+
+def _isotree_structural_distance_matrix(
+    model,
+    *,
+    X,
+    feature_names,
+    redundancy_mode,
+    depth_decay,
+    min_leaf_samples,
+):
+    feature_names = list(feature_names)
+    feature_index = {feature: ix for ix, feature in enumerate(feature_names)}
+    columns = set(map(str, X.columns))
+    trees = model.to_json(as_str=False)
+    if isinstance(trees, dict):
+        trees = [trees]
+
+    path_records = []
+    stats = {"n_extractable_splits": 0}
+    for tree in trees:
+        _collect_structural_leaf_paths(
+            tree,
+            X=X,
+            active_rows=np.arange(len(X)),
+            path=[],
+            path_records=path_records,
+            x_features=set(map(str, feature_names)),
+            columns=columns,
+            stats=stats,
+            min_leaf_samples=min_leaf_samples,
+        )
+
+    if stats["n_extractable_splits"] == 0:
+        raise ValueError("Could not parse split coefficients and thresholds from IsoTree JSON.")
+
+    n_features = len(feature_names)
+    usage = np.zeros(n_features, dtype=float)
+    co_path = np.zeros((n_features, n_features), dtype=float)
+
+    for record in path_records:
+        if record["n_samples"] < min_leaf_samples:
+            continue
+        strengths = np.zeros(n_features, dtype=float)
+        for depth, terms in record["path"]:
+            depth_weight = 1.0 / (1.0 + depth_decay * float(depth))
+            for feature, coef in terms.items():
+                ix = feature_index.get(feature)
+                if ix is not None:
+                    strengths[ix] += abs(float(coef)) * depth_weight
+        active_ix = np.flatnonzero(strengths > 0)
+        if len(active_ix) == 0:
+            continue
+        leaf_weight = float(record["n_samples"])
+        usage += leaf_weight * strengths
+        for i in active_ix:
+            co_path[i, i] += leaf_weight * strengths[i]
+        for pos, i in enumerate(active_ix):
+            for j in active_ix[pos + 1 :]:
+                joint = leaf_weight * min(strengths[i], strengths[j])
+                co_path[i, j] += joint
+                co_path[j, i] += joint
+
+    usage_scale = usage / usage.max() if usage.max() > 0 else usage
+    denom = np.sqrt(np.outer(usage, usage))
+    co_norm = np.divide(co_path, denom, out=np.zeros_like(co_path), where=denom > 0)
+    co_norm = np.clip(co_norm, 0.0, 1.0)
+
+    if redundancy_mode == "cooccurrence":
+        similarity = co_norm
+    else:
+        usage_affinity = np.sqrt(np.outer(usage_scale, usage_scale))
+        similarity = usage_affinity * (1.0 - co_norm)
+
+    np.fill_diagonal(similarity, 1.0)
+    distance = 1.0 - np.clip(similarity, 0.0, 1.0)
+    np.fill_diagonal(distance, 0.0)
+    stats.update(
+        {
+            "usage": usage,
+            "co_path": co_path,
+            "co_path_normalized": co_norm,
+            "n_leaf_paths": len(path_records),
+        }
+    )
+    return distance, stats
+
+
+def _collect_structural_leaf_paths(
+    tree,
+    *,
+    X,
+    active_rows,
+    path,
+    path_records,
+    x_features,
+    columns,
+    stats,
+    min_leaf_samples,
+):
+    if not isinstance(tree, dict):
+        return
+
+    if _looks_like_flat_tree(tree):
+        _collect_flat_structural_leaf_paths(
+            tree,
+            node_key=_flat_tree_root_key(tree),
+            X=X,
+            active_rows=active_rows,
+            path=path,
+            path_records=path_records,
+            x_features=x_features,
+            columns=columns,
+            stats=stats,
+            min_leaf_samples=min_leaf_samples,
+            depth=0,
+        )
+        return
+
+    _collect_node_structural_leaf_paths(
+        tree,
+        X=X,
+        active_rows=active_rows,
+        path=path,
+        path_records=path_records,
+        x_features=x_features,
+        columns=columns,
+        stats=stats,
+        min_leaf_samples=min_leaf_samples,
+        depth=0,
+    )
+
+
+def _collect_flat_structural_leaf_paths(
+    tree,
+    *,
+    node_key,
+    X,
+    active_rows,
+    path,
+    path_records,
+    x_features,
+    columns,
+    stats,
+    min_leaf_samples,
+    depth,
+):
+    node = tree.get(str(node_key), tree.get(node_key))
+    if not isinstance(node, dict) or len(active_rows) == 0:
+        return
+
+    split = _extract_oblique_split(node, columns=columns)
+    children = _left_right_child_refs(node, tree)
+    if split is None or children is None:
+        if len(active_rows) >= min_leaf_samples:
+            path_records.append({"n_samples": int(len(active_rows)), "path": list(path)})
+        return
+
+    terms, threshold = split
+    stats["n_extractable_splits"] += 1
+    path_terms = {feature: coef for feature, coef in terms.items() if feature in x_features}
+    path_next = path + [(depth, path_terms)] if path_terms else path
+
+    left_key, right_key = children
+    X_node = X.iloc[active_rows]
+    routed_left = _evaluate_split_terms(X_node, terms) <= threshold
+    _collect_flat_structural_leaf_paths(
+        tree,
+        node_key=left_key,
+        X=X,
+        active_rows=active_rows[routed_left],
+        path=path_next,
+        path_records=path_records,
+        x_features=x_features,
+        columns=columns,
+        stats=stats,
+        min_leaf_samples=min_leaf_samples,
+        depth=depth + 1,
+    )
+    _collect_flat_structural_leaf_paths(
+        tree,
+        node_key=right_key,
+        X=X,
+        active_rows=active_rows[~routed_left],
+        path=path_next,
+        path_records=path_records,
+        x_features=x_features,
+        columns=columns,
+        stats=stats,
+        min_leaf_samples=min_leaf_samples,
+        depth=depth + 1,
+    )
+
+
+def _collect_node_structural_leaf_paths(
+    node,
+    *,
+    X,
+    active_rows,
+    path,
+    path_records,
+    x_features,
+    columns,
+    stats,
+    min_leaf_samples,
+    depth,
+):
+    if not isinstance(node, dict) or len(active_rows) == 0:
+        return
+
+    split = _extract_oblique_split(node, columns=columns)
+    children = _left_right_children(node)
+    if split is None or children is None:
+        if len(active_rows) >= min_leaf_samples:
+            path_records.append({"n_samples": int(len(active_rows)), "path": list(path)})
+        return
+
+    terms, threshold = split
+    stats["n_extractable_splits"] += 1
+    path_terms = {feature: coef for feature, coef in terms.items() if feature in x_features}
+    path_next = path + [(depth, path_terms)] if path_terms else path
+
+    left_child, right_child = children
+    X_node = X.iloc[active_rows]
+    routed_left = _evaluate_split_terms(X_node, terms) <= threshold
+    _collect_node_structural_leaf_paths(
+        left_child,
+        X=X,
+        active_rows=active_rows[routed_left],
+        path=path_next,
+        path_records=path_records,
+        x_features=x_features,
+        columns=columns,
+        stats=stats,
+        min_leaf_samples=min_leaf_samples,
+        depth=depth + 1,
+    )
+    _collect_node_structural_leaf_paths(
+        right_child,
+        X=X,
+        active_rows=active_rows[~routed_left],
+        path=path_next,
+        path_records=path_records,
+        x_features=x_features,
+        columns=columns,
+        stats=stats,
+        min_leaf_samples=min_leaf_samples,
+        depth=depth + 1,
+    )
+
+
+def _structural_redundancy_feature_scores(X, y, *, feature_names, usage, score_mode, random_state):
+    if score_mode == "auto":
+        score_mode = "mutual_info" if y is not None else "isotree_usage"
+    if score_mode not in {"isotree_usage", "mutual_info"}:
+        raise ValueError("score_mode must be 'auto', 'isotree_usage', or 'mutual_info'.")
+
+    if score_mode == "mutual_info":
+        if y is None:
+            raise ValueError("score_mode='mutual_info' requires y.")
+        from sklearn.feature_selection import mutual_info_regression
+
+        y_series = pd.Series(y).reset_index(drop=True)
+        if len(y_series) != len(X):
+            raise ValueError("X and y must have the same number of rows.")
+        scores = mutual_info_regression(
+            X[feature_names],
+            y_series.to_numpy(),
+            random_state=random_state,
+        )
+    else:
+        scores = np.asarray(usage, dtype=float)
+
+    return (
+        pd.DataFrame({"feature": feature_names, "score": scores})
+        .sort_values(["score", "feature"], ascending=[False, True])
+        .reset_index(drop=True),
+        score_mode,
+    )
+
+
+def _select_cluster_winners(feature_names, labels, feature_scores, *, min_features_to_keep):
+    score_by_feature = feature_scores.set_index("feature")["score"].to_dict()
+    clusters = {}
+    for feature, label in zip(feature_names, labels):
+        clusters.setdefault(int(label), []).append(feature)
+
+    winners = {}
+    for label, features in clusters.items():
+        winners[label] = sorted(features, key=lambda feature: (-score_by_feature.get(feature, 0.0), feature))[0]
+
+    selected = set(winners.values())
+    if len(selected) < min_features_to_keep:
+        for feature in feature_scores["feature"]:
+            selected.add(feature)
+            if len(selected) >= min_features_to_keep:
+                break
+
+    selected_features = [feature for feature in feature_names if feature in selected]
+    removed_features = [feature for feature in feature_names if feature not in selected]
+    return selected_features, removed_features, clusters, winners
 
 
 def _feature_attribution_usage_label(feature_attribution_mode):
