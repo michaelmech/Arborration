@@ -5,8 +5,10 @@ from arborration.feature_selection import (
     _add_competitive_permutation_calibration,
     _add_permutation_calibration,
     _anchored_flip_usage_from_isotree_json,
+    _isotree_structural_distance_matrix,
     _leaf_backtrack_usage_from_isotree_json,
     _make_competitive_augmented_column_weights,
+    _select_cluster_winners,
 )
 
 
@@ -95,6 +97,71 @@ def test_competitive_column_weights_keep_total_target_probability_with_real_lean
     assert np.isclose(real_weight / (real_weight + decoy_weight), 0.60)
     assert real_weight > decoy_weight
     assert x_weight > real_weight + decoy_weight
+
+
+def test_isotree_structural_substitution_distance_groups_alternate_split_features():
+    X = pd.DataFrame(
+        {
+            "x1": [-2.0, -1.0, 1.0, 2.0],
+            "x2": [-3.0, -2.0, 2.0, 3.0],
+            "x3": [0.0, 1.0, 0.0, 1.0],
+        }
+    )
+    tree_x1 = {
+        "0": {
+            "condition": [{"column": "x1", "coef": 1.0}],
+            "threshold": 0.0,
+            "left": "1",
+            "right": "2",
+        },
+        "1": {},
+        "2": {},
+    }
+    tree_x2 = {
+        "0": {
+            "condition": [{"column": "x2", "coef": 1.0}],
+            "threshold": 0.0,
+            "left": "1",
+            "right": "2",
+        },
+        "1": {},
+        "2": {},
+    }
+
+    distance, stats = _isotree_structural_distance_matrix(
+        _FakeIsoTreeModel([tree_x1, tree_x2]),
+        X=X,
+        feature_names=["x1", "x2", "x3"],
+        redundancy_mode="substitution",
+        depth_decay=0.0,
+        min_leaf_samples=1,
+    )
+
+    assert stats["n_extractable_splits"] == 2
+    assert distance[0, 1] == 0.0
+    assert distance[0, 2] == 1.0
+    assert distance[1, 2] == 1.0
+
+
+def test_select_cluster_winners_keeps_highest_scoring_feature_per_cluster():
+    feature_scores = pd.DataFrame(
+        {
+            "feature": ["x2", "x1", "x3"],
+            "score": [5.0, 2.0, 1.0],
+        }
+    )
+
+    selected, removed, clusters, winners = _select_cluster_winners(
+        ["x1", "x2", "x3"],
+        np.array([1, 1, 2]),
+        feature_scores,
+        min_features_to_keep=1,
+    )
+
+    assert selected == ["x2", "x3"]
+    assert removed == ["x1"]
+    assert clusters == {1: ["x1", "x2"], 2: ["x3"]}
+    assert winners == {1: "x2", 2: "x3"}
 
 
 def test_target_anchored_flip_usage_counts_counterfactual_routing_changes():
