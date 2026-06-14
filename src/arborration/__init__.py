@@ -4,6 +4,7 @@ __all__ = [
     "AADForestGenerativeClassifier",
     "IsoForestGenerativeClassifier",
     "PineForestGenerativeClassifier",
+    "ShapIsolationForestFeatureSelector",
     "select_features_by_class_contrast_isotree_json_usage",
     "select_features_by_target_weighted_isotree_json_usage",
     "select_features_for_task",
@@ -29,17 +30,20 @@ def __getattr__(name):
         }
         return exports[name]
     if name in {
+        "ShapIsolationForestFeatureSelector",
         "select_features_by_class_contrast_isotree_json_usage",
         "select_features_by_target_weighted_isotree_json_usage",
         "select_features_for_task",
     }:
         from .feature_selection import (
+            ShapIsolationForestFeatureSelector,
             select_features_by_class_contrast_isotree_json_usage,
             select_features_by_target_weighted_isotree_json_usage,
             select_features_for_task,
         )
 
         exports = {
+            "ShapIsolationForestFeatureSelector": ShapIsolationForestFeatureSelector,
             "select_features_by_class_contrast_isotree_json_usage": select_features_by_class_contrast_isotree_json_usage,
             "select_features_by_target_weighted_isotree_json_usage": select_features_by_target_weighted_isotree_json_usage,
             "select_features_for_task": select_features_for_task,

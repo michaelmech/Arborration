@@ -5,6 +5,9 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from isotree import IsolationForest
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.ensemble import IsolationForest as SklearnIsolationForest
+from sklearn.utils.validation import check_is_fitted
 
 
 def select_features_for_task(X, y, *, task, **kwargs):
@@ -36,6 +39,245 @@ def select_features_for_task(X, y, *, task, **kwargs):
             **kwargs,
         )
     raise ValueError("task must be 'classification' or 'regression'.")
+
+
+class ShapIsolationForestFeatureSelector(BaseEstimator, TransformerMixin):
+    """SHAP-guided unsupervised feature selector for sklearn IsolationForest."""
+
+    def __init__(
+        self,
+        *,
+        n_estimators=100,
+        max_samples="auto",
+        contamination="auto",
+        max_features=1.0,
+        bootstrap=False,
+        n_jobs=None,
+        random_state=None,
+        verbose=0,
+        warm_start=False,
+        drop_fraction=0.10,
+        max_drop_per_iter=1,
+        min_improvement=0.0,
+        min_features=1,
+        max_iter=20,
+        shap_sample_size=None,
+        dispersion_metric=None,
+        estimator_kwargs=None,
+    ):
+        self.n_estimators = n_estimators
+        self.max_samples = max_samples
+        self.contamination = contamination
+        self.max_features = max_features
+        self.bootstrap = bootstrap
+        self.n_jobs = n_jobs
+        self.random_state = random_state
+        self.verbose = verbose
+        self.warm_start = warm_start
+        self.drop_fraction = drop_fraction
+        self.max_drop_per_iter = max_drop_per_iter
+        self.min_improvement = min_improvement
+        self.min_features = min_features
+        self.max_iter = max_iter
+        self.shap_sample_size = shap_sample_size
+        self.dispersion_metric = dispersion_metric
+        self.estimator_kwargs = estimator_kwargs
+
+    def fit(self, X, y=None):
+        """Fit the selector and retain the best validated IsolationForest."""
+        self._validate_params()
+        X_frame = _to_frame(X).astype(float)
+        feature_names = list(X_frame.columns)
+        current_features = list(feature_names)
+        history = []
+
+        estimator = self._fit_isolation_forest(X_frame[current_features], iteration=0)
+        current_scores = self._anomaly_scores(estimator, X_frame[current_features])
+        current_metric = self._dispersion(current_scores)
+        current_importances = self._mean_abs_shap_importance(
+            estimator,
+            X_frame[current_features],
+            iteration=0,
+        )
+
+        max_iter = np.inf if self.max_iter is None else int(self.max_iter)
+        iteration = 0
+        while iteration < max_iter and len(current_features) > self.min_features:
+            n_drop = self._n_features_to_drop(len(current_features))
+            if n_drop <= 0:
+                break
+
+            ordered = current_importances.sort_values(
+                ["mean_abs_shap", "feature"],
+                ascending=[True, True],
+            )
+            candidate_features = ordered["feature"].head(n_drop).tolist()
+            if not candidate_features:
+                break
+
+            reduced_features = [f for f in current_features if f not in set(candidate_features)]
+            if len(reduced_features) < self.min_features:
+                candidate_features = candidate_features[: len(current_features) - self.min_features]
+                reduced_features = [f for f in current_features if f not in set(candidate_features)]
+            if not candidate_features or len(reduced_features) < self.min_features:
+                break
+
+            candidate_estimator = self._fit_isolation_forest(
+                X_frame[reduced_features],
+                iteration=iteration + 1,
+            )
+            candidate_scores = self._anomaly_scores(candidate_estimator, X_frame[reduced_features])
+            candidate_metric = self._dispersion(candidate_scores)
+            improvement = candidate_metric - current_metric
+            accepted = improvement > self.min_improvement
+            history.append(
+                {
+                    "iteration": int(iteration),
+                    "n_features_before": int(len(current_features)),
+                    "n_features_after": int(len(reduced_features)),
+                    "candidate_removed_features": list(candidate_features),
+                    "current_metric": float(current_metric),
+                    "candidate_metric": float(candidate_metric),
+                    "improvement": float(improvement),
+                    "min_improvement": float(self.min_improvement),
+                    "accepted": bool(accepted),
+                    "shap_importances": current_importances.copy(),
+                }
+            )
+            if not accepted:
+                break
+
+            current_features = reduced_features
+            estimator = candidate_estimator
+            current_metric = candidate_metric
+            current_importances = self._mean_abs_shap_importance(
+                estimator,
+                X_frame[current_features],
+                iteration=iteration + 1,
+            )
+            iteration += 1
+
+        self.feature_names_in_ = np.asarray(feature_names, dtype=object)
+        self.n_features_in_ = len(feature_names)
+        self.selected_feature_names_ = list(current_features)
+        self.selected_features_ = list(current_features)
+        self.selected_indices_ = np.asarray(
+            [feature_names.index(feature) for feature in current_features],
+            dtype=int,
+        )
+        support = np.zeros(len(feature_names), dtype=bool)
+        support[self.selected_indices_] = True
+        self.support_mask_ = support
+        self.estimator_ = estimator
+        self.final_estimator_ = estimator
+        self.final_metric_ = float(current_metric)
+        self.shap_importances_ = current_importances.copy()
+        self.history_ = history
+        return self
+
+    def transform(self, X):
+        """Return X restricted to the selected features."""
+        check_is_fitted(self, "support_mask_")
+        X_frame = _to_frame(X)
+        if list(X_frame.columns) == list(self.feature_names_in_):
+            return X_frame.loc[:, self.selected_feature_names_]
+        if X_frame.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"X has {X_frame.shape[1]} features, but this selector was fitted with "
+                f"{self.n_features_in_} features."
+            )
+        return X_frame.iloc[:, self.selected_indices_]
+
+    def get_support(self, indices=False):
+        """Return a boolean support mask or selected feature indices."""
+        check_is_fitted(self, "support_mask_")
+        return self.selected_indices_.copy() if indices else self.support_mask_.copy()
+
+    def _validate_params(self):
+        if not (0.0 < self.drop_fraction <= 1.0):
+            raise ValueError("drop_fraction must be in (0, 1].")
+        if int(self.max_drop_per_iter) < 1:
+            raise ValueError("max_drop_per_iter must be at least 1.")
+        if int(self.min_features) < 1:
+            raise ValueError("min_features must be at least 1.")
+        if self.min_improvement < 0:
+            raise ValueError("min_improvement must be nonnegative.")
+        if self.max_iter is not None and int(self.max_iter) < 1:
+            raise ValueError("max_iter must be at least 1 or None.")
+        if self.shap_sample_size is not None and int(self.shap_sample_size) < 1:
+            raise ValueError("shap_sample_size must be at least 1 or None.")
+
+    def _fit_isolation_forest(self, X, *, iteration):
+        params = dict(self.estimator_kwargs or {})
+        params.update(
+            {
+                "n_estimators": self.n_estimators,
+                "max_samples": self.max_samples,
+                "contamination": self.contamination,
+                "max_features": self.max_features,
+                "bootstrap": self.bootstrap,
+                "n_jobs": self.n_jobs,
+                "random_state": self._iteration_seed(iteration),
+                "verbose": self.verbose,
+                "warm_start": self.warm_start,
+            }
+        )
+        estimator = SklearnIsolationForest(**params)
+        estimator.fit(X)
+        return estimator
+
+    def _iteration_seed(self, iteration):
+        if self.random_state is None:
+            return None
+        return int(self.random_state) + int(iteration)
+
+    @staticmethod
+    def _anomaly_scores(estimator, X):
+        return -np.asarray(estimator.score_samples(X), dtype=float)
+
+    def _dispersion(self, anomaly_scores):
+        if self.dispersion_metric is None or self.dispersion_metric == "p99_median_gap":
+            return float(np.percentile(anomaly_scores, 99) - np.median(anomaly_scores))
+        if callable(self.dispersion_metric):
+            return float(self.dispersion_metric(np.asarray(anomaly_scores, dtype=float)))
+        raise ValueError("dispersion_metric must be None, 'p99_median_gap', or a callable.")
+
+    def _mean_abs_shap_importance(self, estimator, X, *, iteration):
+        try:
+            import shap
+        except ImportError as exc:
+            raise ImportError(
+                "ShapIsolationForestFeatureSelector requires the 'shap' package. "
+                "Install arborration with its updated requirements or run `pip install shap`."
+            ) from exc
+
+        X_explain = self._shap_sample(X, iteration=iteration)
+        explainer = shap.TreeExplainer(estimator)
+        shap_values = explainer.shap_values(X_explain)
+        if isinstance(shap_values, list):
+            values = np.sum([np.asarray(v, dtype=float) for v in shap_values], axis=0)
+        else:
+            values = np.asarray(shap_values, dtype=float)
+        if values.ndim == 3:
+            values = values.sum(axis=-1)
+        importances = np.mean(np.abs(values), axis=0)
+        return pd.DataFrame(
+            {
+                "feature": list(X.columns),
+                "mean_abs_shap": importances,
+            }
+        ).sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
+
+    def _shap_sample(self, X, *, iteration):
+        if self.shap_sample_size is None or len(X) <= int(self.shap_sample_size):
+            return X
+        random_state = self._iteration_seed(10_000 + iteration)
+        return X.sample(n=int(self.shap_sample_size), random_state=random_state)
+
+    def _n_features_to_drop(self, n_features):
+        max_removable_for_floor = max(0, int(n_features) - int(self.min_features))
+        drop_by_fraction = max(1, int(np.floor(float(self.drop_fraction) * int(n_features))))
+        return min(max_removable_for_floor, int(self.max_drop_per_iter), drop_by_fraction)
 
 
 def select_features_by_target_weighted_isotree_json_usage(
