@@ -4,11 +4,21 @@ __all__ = [
     "AADForestGenerativeClassifier",
     "IsoForestGenerativeClassifier",
     "PineForestGenerativeClassifier",
+    "ShapIsolationForestFeatureSelector",
 ]
 
 
 def __getattr__(name):
-    if name in __all__:
+    if name == "ShapIsolationForestFeatureSelector":
+        from .feature_selection import ShapIsolationForestFeatureSelector
+
+        return ShapIsolationForestFeatureSelector
+
+    if name in {
+        "AADForestGenerativeClassifier",
+        "IsoForestGenerativeClassifier",
+        "PineForestGenerativeClassifier",
+    }:
         from .classifiers import (
             AADForestGenerativeClassifier,
             IsoForestGenerativeClassifier,
