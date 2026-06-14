@@ -7,6 +7,7 @@ import pandas as pd
 from isotree import IsolationForest
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.ensemble import IsolationForest as SklearnIsolationForest
+from sklearn.model_selection import KFold
 from sklearn.utils.validation import check_is_fitted
 
 
@@ -62,7 +63,9 @@ class ShapIsolationForestFeatureSelector(BaseEstimator, TransformerMixin):
         min_features=1,
         max_iter=20,
         shap_sample_size=None,
-        dispersion_metric=None,
+        dispersion_metric="tail_mean_median_gap",
+        tail_quantile=0.95,
+        validation_cv=1,
         estimator_kwargs=None,
     ):
         self.n_estimators = n_estimators
@@ -81,6 +84,8 @@ class ShapIsolationForestFeatureSelector(BaseEstimator, TransformerMixin):
         self.max_iter = max_iter
         self.shap_sample_size = shap_sample_size
         self.dispersion_metric = dispersion_metric
+        self.tail_quantile = tail_quantile
+        self.validation_cv = validation_cv
         self.estimator_kwargs = estimator_kwargs
 
     def fit(self, X, y=None):
@@ -122,13 +127,16 @@ class ShapIsolationForestFeatureSelector(BaseEstimator, TransformerMixin):
             if not candidate_features or len(reduced_features) < self.min_features:
                 break
 
-            candidate_estimator = self._fit_isolation_forest(
-                X_frame[reduced_features],
-                iteration=iteration + 1,
+            validation_result = self._validate_candidate_removal(
+                X_frame,
+                current_features=current_features,
+                reduced_features=reduced_features,
+                current_metric=current_metric,
+                iteration=iteration,
             )
-            candidate_scores = self._anomaly_scores(candidate_estimator, X_frame[reduced_features])
-            candidate_metric = self._dispersion(candidate_scores)
-            improvement = candidate_metric - current_metric
+            validation_current_metric = validation_result["current_metric"]
+            candidate_metric = validation_result["candidate_metric"]
+            improvement = validation_result["improvement"]
             accepted = improvement > self.min_improvement
             history.append(
                 {
@@ -136,11 +144,15 @@ class ShapIsolationForestFeatureSelector(BaseEstimator, TransformerMixin):
                     "n_features_before": int(len(current_features)),
                     "n_features_after": int(len(reduced_features)),
                     "candidate_removed_features": list(candidate_features),
-                    "current_metric": float(current_metric),
+                    "current_metric": float(validation_current_metric),
                     "candidate_metric": float(candidate_metric),
                     "improvement": float(improvement),
                     "min_improvement": float(self.min_improvement),
                     "accepted": bool(accepted),
+                    "validation_mode": validation_result["validation_mode"],
+                    "validation_cv": validation_result["validation_cv"],
+                    "fold_improvements": validation_result["fold_improvements"],
+                    "fold_improvement_std": validation_result["fold_improvement_std"],
                     "shap_importances": current_importances.copy(),
                 }
             )
@@ -148,8 +160,12 @@ class ShapIsolationForestFeatureSelector(BaseEstimator, TransformerMixin):
                 break
 
             current_features = reduced_features
-            estimator = candidate_estimator
-            current_metric = candidate_metric
+            estimator = self._fit_isolation_forest(
+                X_frame[current_features],
+                iteration=iteration + 1,
+            )
+            current_scores = self._anomaly_scores(estimator, X_frame[current_features])
+            current_metric = self._dispersion(current_scores)
             current_importances = self._mean_abs_shap_importance(
                 estimator,
                 X_frame[current_features],
@@ -206,6 +222,10 @@ class ShapIsolationForestFeatureSelector(BaseEstimator, TransformerMixin):
             raise ValueError("max_iter must be at least 1 or None.")
         if self.shap_sample_size is not None and int(self.shap_sample_size) < 1:
             raise ValueError("shap_sample_size must be at least 1 or None.")
+        if not (0.5 < float(self.tail_quantile) < 1.0):
+            raise ValueError("tail_quantile must be in (0.5, 1.0).")
+        if int(self.validation_cv) < 1:
+            raise ValueError("validation_cv must be at least 1.")
 
     def _fit_isolation_forest(self, X, *, iteration):
         params = dict(self.estimator_kwargs or {})
@@ -236,11 +256,21 @@ class ShapIsolationForestFeatureSelector(BaseEstimator, TransformerMixin):
         return -np.asarray(estimator.score_samples(X), dtype=float)
 
     def _dispersion(self, anomaly_scores):
-        if self.dispersion_metric is None or self.dispersion_metric == "p99_median_gap":
+        if self.dispersion_metric is None or self.dispersion_metric == "tail_mean_median_gap":
+            scores = np.asarray(anomaly_scores, dtype=float)
+            tail_size = max(1, int(np.ceil((1.0 - float(self.tail_quantile)) * len(scores))))
+            tail = np.partition(scores, -tail_size)[-tail_size:]
+            return float(tail.mean() - np.median(scores))
+        if self.dispersion_metric == "p99_median_gap":
             return float(np.percentile(anomaly_scores, 99) - np.median(anomaly_scores))
+        if self.dispersion_metric == "p95_median_gap":
+            return float(np.percentile(anomaly_scores, 95) - np.median(anomaly_scores))
         if callable(self.dispersion_metric):
             return float(self.dispersion_metric(np.asarray(anomaly_scores, dtype=float)))
-        raise ValueError("dispersion_metric must be None, 'p99_median_gap', or a callable.")
+        raise ValueError(
+            "dispersion_metric must be None, 'tail_mean_median_gap', "
+            "'p99_median_gap', 'p95_median_gap', or a callable."
+        )
 
     def _mean_abs_shap_importance(self, estimator, X, *, iteration):
         try:
@@ -278,6 +308,77 @@ class ShapIsolationForestFeatureSelector(BaseEstimator, TransformerMixin):
         max_removable_for_floor = max(0, int(n_features) - int(self.min_features))
         drop_by_fraction = max(1, int(np.floor(float(self.drop_fraction) * int(n_features))))
         return min(max_removable_for_floor, int(self.max_drop_per_iter), drop_by_fraction)
+
+    def _validate_candidate_removal(
+        self,
+        X_frame,
+        *,
+        current_features,
+        reduced_features,
+        current_metric,
+        iteration,
+    ):
+        validation_cv = min(int(self.validation_cv), len(X_frame))
+        if validation_cv < 2:
+            candidate_estimator = self._fit_isolation_forest(
+                X_frame[reduced_features],
+                iteration=iteration + 1,
+            )
+            candidate_scores = self._anomaly_scores(candidate_estimator, X_frame[reduced_features])
+            candidate_metric = self._dispersion(candidate_scores)
+            improvement = candidate_metric - current_metric
+            return {
+                "validation_mode": "in_sample",
+                "validation_cv": 1,
+                "current_metric": float(current_metric),
+                "candidate_metric": float(candidate_metric),
+                "improvement": float(improvement),
+                "fold_improvements": [],
+                "fold_improvement_std": 0.0,
+            }
+
+        splitter = KFold(
+            n_splits=validation_cv,
+            shuffle=True,
+            random_state=self._iteration_seed(100_000 + iteration),
+        )
+        fold_current_metrics = []
+        fold_candidate_metrics = []
+        fold_improvements = []
+        for fold_ix, (train_ix, validation_ix) in enumerate(splitter.split(X_frame)):
+            current_estimator = self._fit_isolation_forest(
+                X_frame.iloc[train_ix][current_features],
+                iteration=100_000 + 1_000 * iteration + fold_ix,
+            )
+            current_scores = self._anomaly_scores(
+                current_estimator,
+                X_frame.iloc[validation_ix][current_features],
+            )
+            fold_current_metric = self._dispersion(current_scores)
+
+            candidate_estimator = self._fit_isolation_forest(
+                X_frame.iloc[train_ix][reduced_features],
+                iteration=200_000 + 1_000 * iteration + fold_ix,
+            )
+            candidate_scores = self._anomaly_scores(
+                candidate_estimator,
+                X_frame.iloc[validation_ix][reduced_features],
+            )
+            fold_candidate_metric = self._dispersion(candidate_scores)
+            fold_current_metrics.append(float(fold_current_metric))
+            fold_candidate_metrics.append(float(fold_candidate_metric))
+            fold_improvements.append(float(fold_candidate_metric - fold_current_metric))
+
+        improvement = float(np.mean(fold_improvements))
+        return {
+            "validation_mode": "cross_validated",
+            "validation_cv": int(validation_cv),
+            "current_metric": float(np.mean(fold_current_metrics)),
+            "candidate_metric": float(np.mean(fold_candidate_metrics)),
+            "improvement": improvement,
+            "fold_improvements": fold_improvements,
+            "fold_improvement_std": float(np.std(fold_improvements, ddof=0)),
+        }
 
 
 def select_features_by_target_weighted_isotree_json_usage(
