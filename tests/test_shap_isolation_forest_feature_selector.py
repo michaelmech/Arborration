@@ -116,6 +116,37 @@ def test_shap_isolation_forest_selector_stops_on_rejected_removal(monkeypatch):
     assert selector.history_[0]["accepted"] is False
 
 
+def test_shap_isolation_forest_selector_can_prune_by_rank_without_metric_improvement(monkeypatch):
+    monkeypatch.setitem(sys.modules, "shap", types.SimpleNamespace(TreeExplainer=_FakeTreeExplainer))
+    X = pd.DataFrame(
+        {
+            "least_important": np.arange(20, dtype=float),
+            "middle": np.arange(20, dtype=float) * 2.0,
+            "most_important": np.arange(20, dtype=float) * -1.0,
+        }
+    )
+
+    selector = ShapIsolationForestFeatureSelector(
+        n_estimators=10,
+        random_state=11,
+        drop_fraction=0.34,
+        max_drop_per_iter=1,
+        min_features=2,
+        max_iter=1,
+        min_improvement=0.0,
+        acceptance_mode="rank_only",
+    )
+    metrics = iter([1.0, 0.0, 0.0])
+    monkeypatch.setattr(selector, "_dispersion", lambda scores: next(metrics))
+    selector.fit(X)
+
+    assert selector.selected_feature_names_ == ["middle", "most_important"]
+    assert selector.history_[0]["candidate_removed_features"] == ["least_important"]
+    assert selector.history_[0]["improvement"] < 0
+    assert selector.history_[0]["accepted"] is True
+    assert selector.history_[0]["acceptance_mode"] == "rank_only"
+
+
 def test_tail_mean_median_gap_averages_the_top_score_tail():
     scores = np.arange(100, dtype=float)
     robust_selector = ShapIsolationForestFeatureSelector(

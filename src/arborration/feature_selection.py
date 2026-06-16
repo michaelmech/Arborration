@@ -66,6 +66,7 @@ class ShapIsolationForestFeatureSelector(BaseEstimator, TransformerMixin):
         dispersion_metric="tail_mean_median_gap",
         tail_quantile=0.95,
         validation_cv=1,
+        acceptance_mode="validated",
         estimator_kwargs=None,
     ):
         self.n_estimators = n_estimators
@@ -86,6 +87,7 @@ class ShapIsolationForestFeatureSelector(BaseEstimator, TransformerMixin):
         self.dispersion_metric = dispersion_metric
         self.tail_quantile = tail_quantile
         self.validation_cv = validation_cv
+        self.acceptance_mode = acceptance_mode
         self.estimator_kwargs = estimator_kwargs
 
     def fit(self, X, y=None):
@@ -137,7 +139,7 @@ class ShapIsolationForestFeatureSelector(BaseEstimator, TransformerMixin):
             validation_current_metric = validation_result["current_metric"]
             candidate_metric = validation_result["candidate_metric"]
             improvement = validation_result["improvement"]
-            accepted = improvement > self.min_improvement
+            accepted = self._accept_candidate_removal(improvement)
             history.append(
                 {
                     "iteration": int(iteration),
@@ -149,6 +151,7 @@ class ShapIsolationForestFeatureSelector(BaseEstimator, TransformerMixin):
                     "improvement": float(improvement),
                     "min_improvement": float(self.min_improvement),
                     "accepted": bool(accepted),
+                    "acceptance_mode": self.acceptance_mode,
                     "validation_mode": validation_result["validation_mode"],
                     "validation_cv": validation_result["validation_cv"],
                     "fold_improvements": validation_result["fold_improvements"],
@@ -226,6 +229,17 @@ class ShapIsolationForestFeatureSelector(BaseEstimator, TransformerMixin):
             raise ValueError("tail_quantile must be in (0.5, 1.0).")
         if int(self.validation_cv) < 1:
             raise ValueError("validation_cv must be at least 1.")
+        if self.acceptance_mode not in {"validated", "non_worsening", "rank_only"}:
+            raise ValueError(
+                "acceptance_mode must be 'validated', 'non_worsening', or 'rank_only'."
+            )
+
+    def _accept_candidate_removal(self, improvement):
+        if self.acceptance_mode == "rank_only":
+            return True
+        if self.acceptance_mode == "non_worsening":
+            return improvement >= self.min_improvement
+        return improvement > self.min_improvement
 
     def _fit_isolation_forest(self, X, *, iteration):
         params = dict(self.estimator_kwargs or {})
